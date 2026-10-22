@@ -1,0 +1,81 @@
+# LLMux example configuration.   Run:  llmux --config configs/llmux.example.yaml --tui
+#
+# ${VAR} and ${VAR:-default} are expanded from the environment before parsing,
+# so secrets never need to live in this file.
+
+server:
+  listen: ":8080"
+  read_header_timeout: 15s
+  idle_timeout: 120s
+  shutdown_timeout: 10s
+  max_body_bytes: 33554432       # 32 MiB request limit
+  log_level: info                # debug | info | warn | error
+  log_file: llmux.log            # only used with --tui (the TUI owns the terminal)
+
+# Client API keys accepted by every virtual host that does not define its own.
+# Keys are read from "Authorization: Bearer <key>", "x-api-key" or "api-key".
+# Leave empty to run an open gateway.
+auth:
+  api_keys:
+    - ${LLMUX_API_KEY:-change-me}
+
+# Traffic recording (always enabled when started with --tui).
+inspector:
+  enabled: false
+  history: 1000                  # exchanges kept in memory
+  body_limit: 1048576            # bytes captured per body
+  redact: true                   # mask Authorization / x-api-key in captured headers
+
+# Virtual hosts. The request's Host header selects the entry:
+#   exact name  >  "*.wildcard"  >  "*" (catch-all)
+hosts:
+  # 1) OpenAI-compatible clients -> a local Ollama server.
+  #    Requests are translated (OpenAI chat/models <-> Ollama /api/chat, /api/tags).
+  - name: local-ollama
+    hosts: ["openai.localhost", "llm.example.com"]
+    dialects: [openai]           # APIs exposed to clients (default: all)
+    upstream:
+      type: ollama               # what the upstream server speaks
+      url: http://localhost:11434
+      timeout: 5m                # max wait for response headers (streams may run longer)
+    model_map:                   # client model name -> upstream model name
+      gpt-4o-mini: llama3.2:3b
+      gpt-4o: qwen2.5:14b
+
+  # 2) Ollama-compatible clients (Open WebUI, Continue, ...) -> OpenAI.
+  - name: ollama-facade
+    hosts: ["ollama.localhost", "*.ollama.example.com"]
+    dialects: [ollama]
+    api_keys: ["${OLLAMA_FACADE_KEY:-secret-2}"]   # overrides auth.api_keys
+    upstream:
+      type: openai
+      url: https://api.openai.com      # server root; "/v1" is added by LLMux
+      api_key: ${OPENAI_API_KEY}
+    model_map:
+      llama3: gpt-4o-mini
+    headers:
+      request:
+        set:                     # override / add upstream request headers
+          OpenAI-Organization: ${OPENAI_ORG:-}   # empty value => header removed
+          X-Gateway: llmux
+        remove: [X-Forwarded-For, Cookie]
+      response:
+        remove: ["openai-*", "x-ratelimit-*"]    # hide upstream internals
+
+  # 3) Catch-all: speak both dialects against one OpenAI-compatible server.
+  #    Same dialect in and out => transparent reverse proxy (all paths, embeddings,
+  #    images... streaming untouched). Cross-dialect => translation.
+  - name: default
+    hosts: ["*"]
+    upstream:
+      type: openai
+      url: http://localhost:8000     # e.g. vLLM / llama.cpp / LM Studio
+      insecure_skip_verify: false
+    headers:
+      request:
+        # Allow-list of client headers forwarded upstream (supports "prefix*").
+        # Without it every non-sensitive header is forwarded. Authorization and
+        # x-api-key are never forwarded unless listed here.
+        forward: [Accept, Content-Type, User-Agent, "X-Request-*", "X-Trace-*"]
+        set:
+          X-Gateway: llmux

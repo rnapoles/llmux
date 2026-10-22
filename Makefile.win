@@ -1,0 +1,96 @@
+# Makefile.win — Windows build file for LLMux, for use with MinGW's make.
+#
+#   mingw32-make.exe -f Makefile.win            (same as "build")
+#   mingw32-make.exe -f Makefile.win tui
+#   mingw32-make.exe -f Makefile.win help
+#
+# Requirements: Go 1.22+ on PATH. Git is optional (used only for the version
+# string). "test" additionally needs gcc (MinGW-w64) because the race detector
+# uses cgo; use "test-fast" if you do not have it.
+
+# Force cmd.exe even when sh.exe (Git for Windows, MSYS) is on PATH, so the
+# recipes below behave the same on every machine.
+SHELL := cmd.exe
+
+APP     := llmux
+BIN_DIR := bin
+EXE     := $(BIN_DIR)\$(APP).exe
+CONFIG  ?= configs\llmux.example.yaml
+
+# Version: git tag/commit when available, otherwise "dev".
+VERSION ?= $(shell git describe --tags --always --dirty 2>NUL)
+ifeq ($(strip $(VERSION)),)
+VERSION := dev
+endif
+LDFLAGS := -s -w -X main.version=$(VERSION)
+
+.DEFAULT_GOAL := build
+.PHONY: build run tui test test-fast vet tidy fmt clean docker help \
+        build-linux build-darwin build-all dist
+
+help:
+	@echo LLMux $(VERSION) - targets:
+	@echo   build        compile $(EXE)  (default)
+	@echo   run          build and start with CONFIG=$(CONFIG)
+	@echo   tui          build and start with the terminal UI
+	@echo   test         go vet + go test -race   (needs gcc)
+	@echo   test-fast    go vet + go test         (no cgo)
+	@echo   tidy         go mod tidy
+	@echo   fmt          gofmt -w .
+	@echo   build-linux  cross-compile $(BIN_DIR)\$(APP)-linux-amd64
+	@echo   build-darwin cross-compile $(BIN_DIR)\$(APP)-darwin-arm64
+	@echo   build-all    windows + linux + darwin binaries
+	@echo   dist         build-all and zip them into $(BIN_DIR)\$(APP)-$(VERSION).zip
+	@echo   docker       docker build -t $(APP):$(VERSION) .
+	@echo   clean        remove $(BIN_DIR)
+	@echo.
+	@echo Examples:
+	@echo   mingw32-make.exe -f Makefile.win run CONFIG=my.yaml
+	@echo   mingw32-make.exe -f Makefile.win VERSION=1.2.0 build
+
+$(BIN_DIR):
+	@if not exist $(BIN_DIR) mkdir $(BIN_DIR)
+
+build: $(BIN_DIR)
+	set CGO_ENABLED=0&& go build -trimpath -ldflags "$(LDFLAGS)" -o $(EXE) .\cmd\llmux
+	@echo Built $(EXE) ($(VERSION))
+
+run: build
+	$(EXE) --config $(CONFIG)
+
+tui: build
+	$(EXE) --config $(CONFIG) --tui
+
+vet:
+	go vet ./...
+
+test: vet
+	set CGO_ENABLED=1&& go test -race ./...
+
+test-fast: vet
+	go test ./...
+
+tidy:
+	go mod tidy
+
+fmt:
+	gofmt -w .
+
+# ---- cross compilation ------------------------------------------------------
+
+build-linux: $(BIN_DIR)
+	set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)\$(APP)-linux-amd64 .\cmd\llmux
+
+build-darwin: $(BIN_DIR)
+	set CGO_ENABLED=0&& set GOOS=darwin&& set GOARCH=arm64&& go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)\$(APP)-darwin-arm64 .\cmd\llmux
+
+build-all: build build-linux build-darwin
+
+dist: build-all
+	powershell -NoProfile -Command "Compress-Archive -Force -Path '$(BIN_DIR)\$(APP)*','README.md','LICENSE','configs' -DestinationPath '$(BIN_DIR)\$(APP)-$(VERSION).zip'"
+
+docker:
+	docker build -t $(APP):$(VERSION) --build-arg VERSION=$(VERSION) .
+
+clean:
+	@if exist $(BIN_DIR) rmdir /s /q $(BIN_DIR)
