@@ -1,0 +1,28 @@
+# llmux.yaml  —  llmux --config llmux.yaml --tui
+server:
+  listen: ":8081"            # 11434 is taken by llama-server, so LLMux uses 8080
+  log_level: info
+  log_file: llmux.log        # used only with --tui
+
+# Keys that clients must send to LLMux. They are separate from the upstream keys.
+auth:
+  api_keys:
+    - ${LLMUX_API_KEY:-my-gateway-key}
+
+hosts:
+  - name: llama
+    hosts: ["*"]             # catch-all; use e.g. ["llm.localhost"] to restrict
+    dialects: [openai, ollama]   # expose both APIs to clients
+    upstream:
+      type: openai           # llama-server speaks the OpenAI API under /v1
+      url: http://127.0.0.1:11434
+      api_key: 0xkey_one     # llama-server accepts any one of its three keys
+      timeout: 5m
+    model_map:               # optional aliases -> the model name llama-server reports
+      gpt-4o-mini: ggml-org/Qwen3.5-0.8B-GGUF
+      qwen: ggml-org/Qwen3.5-0.8B-GGUF
+    headers:
+      request:
+        remove: [Cookie]
+        set:
+          X-Gateway: llmux
