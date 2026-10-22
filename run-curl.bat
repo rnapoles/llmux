@@ -1,0 +1,1 @@
+curl localhost:8081/v1/chat/completions -H "Authorization: Bearer my-gateway-key" -H "Content-Type: application/json" -d "{\"model\":\"qwen\",\"messages\":[{\"role\":\"user\",\"content\":\"Hi\"}],\"stream\":false}"

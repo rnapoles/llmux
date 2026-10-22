@@ -2,8 +2,10 @@
 
 **LLMux** is a single-binary LLM gateway written in Go. It *emulates* the **OpenAI** and **Ollama**
 APIs towards your clients and forwards the traffic to any OpenAI-compatible or Ollama server, with
-**virtual-host** routing, API-key auth, header forwarding/overriding, model aliasing — and a sleek
+**virtual-host** routing, API-key auth, header forwarding/overriding, model aliasing - and a sleek
 **terminal UI** to inspect every request and response live.
+
+![Screenshot of LLMux](docs/screenshots/screenshot-01.png)
 
 ```
  clients                         LLMux                              upstreams
@@ -100,7 +102,7 @@ credentials if you did not set them:
 ╰──────────────────────────────────╯╰─────────────────────────────────────────────────────────────────────╯
 ```
 
-Left: live request list (newest first). Right: the selected exchange — overview with the assembled
+Left: live request list (newest first). Right: the selected exchange - overview with the assembled
 **conversation**, the client request/response, and the **upstream** request/response (so you can see
 exactly what translation produced). JSON is pretty-printed and syntax highlighted; SSE/NDJSON streams
 are shown one event per line. Credentials in captured headers are masked (`inspector.redact`).
@@ -138,20 +140,12 @@ internal/
   app/               composition root
 ```
 
-| Principle | Where |
-|---|---|
-| **S**ingle responsibility | Header policy, authenticator, host table, capture writer, upstream transport, and the inspector are separate types; wire formats are described once in `wire/`. |
-| **O**pen/closed | New API = new package + one `Register` line. Gateway, TUI and config are untouched. |
-| **L**iskov | Every `Dialect`/`Backend` is interchangeable; the gateway only uses the interface contracts (e.g. a `StreamReader` always ends with exactly one `Done` chunk). |
-| **I**nterface segregation | `Matcher`, `ChatCodec`, `ModelsCodec`, `ErrorWriter`, optional `InfoWriter`; `ChatBackend`, `ModelLister`. |
-| **D**ependency inversion | `gateway` depends on `core` interfaces and on `DialectSource`/`BackendSource`, wired in `app`. |
-
 ### Adding a new LLM API (e.g. Anthropic)
 
-1. **Wire format** — `internal/wire/anthropic/types.go`: request/response structs plus `ToCore` /
+1. **Wire format** - `internal/wire/anthropic/types.go`: request/response structs plus `ToCore` /
    `FromCore…` mappers (Messages API: `system`, `messages`, `max_tokens`, `content[]` blocks, SSE events
    `content_block_delta` / `message_delta`).
-2. **As an upstream** — `internal/backend/anthropic/backend.go` implementing `core.Backend`:
+2. **As an upstream** - `internal/backend/anthropic/backend.go` implementing `core.Backend`:
 
    ```go
    func (b *Backend) Dialect() string { return "anthropic" }
@@ -162,11 +156,8 @@ internal/
    // Chat → POST /v1/messages ; ChatStream → SSE → core.StreamChunk ; Models → GET /v1/models
    ```
    Register: `r.Register("anthropic", anthropic.Factory)` in `backend/registry.go`.
-3. **As a client-facing API** — `internal/dialect/anthropic/dialect.go` implementing `core.Dialect`
+3. **As a client-facing API** - `internal/dialect/anthropic/dialect.go` implementing `core.Dialect`
    (`Match` → `POST /v1/messages`, encoders for JSON and SSE). Register it in `dialect/registry.go`.
-
-Immediately you get Anthropic ⇄ OpenAI ⇄ Ollama translation, virtual hosts, auth, header rules and TUI
-inspection — and Anthropic-in/Anthropic-out is a transparent proxy for free.
 
 ## Behaviour notes & limits
 
@@ -183,4 +174,12 @@ inspection — and Anthropic-in/Anthropic-out is a transparent proxy for free.
 make test       # go vet + go test -race ./...
 make build      # static binary in bin/
 make docker     # container image
+```
+
+On Windows with MinGW use `Makefile.win` instead:
+
+```bat
+mingw32-make.exe -f Makefile.win           :: build -> bin\llmux.exe
+mingw32-make.exe -f Makefile.win tui       :: build and start with the TUI
+mingw32-make.exe -f Makefile.win help      :: list targets (test, test-fast, build-all, dist, ...)
 ```
