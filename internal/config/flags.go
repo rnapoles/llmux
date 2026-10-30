@@ -21,6 +21,8 @@ type Options struct {
 	RemoveHeaders  multi
 	ForwardHeaders multi
 	ModelMap       multi
+	SQLitePath     string
+	SQLiteRedact   bool
 	TUI            bool
 	LogLevel       string
 	Version        bool
@@ -41,6 +43,7 @@ Examples:
   llmux --config llmux.yaml
   llmux --upstream http://localhost:11434 --upstream-type ollama --listen :8080
   llmux --upstream https://api.openai.com --upstream-key $OPENAI_API_KEY --api-key secret --tui
+  llmux --upstream http://localhost:11434 --upstream-type ollama --sqlite traffic.db
 
 Flags:
 `
@@ -66,6 +69,8 @@ func ParseFlags(args []string, out io.Writer) (*Options, error) {
 	fs.Var(&o.RemoveHeaders, "remove-header", "drop an upstream request header (repeatable)")
 	fs.Var(&o.ForwardHeaders, "forward-header", "only forward these client headers upstream (repeatable)")
 	fs.Var(&o.ModelMap, "model-map", `rewrite model names, "alias=real" (repeatable)`)
+	fs.StringVar(&o.SQLitePath, "sqlite", "", "persist every request/response (full headers and bodies) into this SQLite file")
+	fs.BoolVar(&o.SQLiteRedact, "sqlite-redact", false, "mask credentials in headers stored in SQLite")
 	fs.BoolVar(&o.TUI, "tui", false, "show the interactive terminal UI")
 	fs.StringVar(&o.LogLevel, "log-level", "", "debug | info | warn | error")
 	fs.BoolVar(&o.Version, "version", false, "print version and exit")
@@ -93,6 +98,13 @@ func Resolve(o *Options) (Config, error) {
 	}
 	if o.TUI {
 		cfg.TUI = true
+	}
+	if o.SQLitePath != "" {
+		cfg.Storage.SQLite.Enabled = true
+		cfg.Storage.SQLite.Path = o.SQLitePath
+	}
+	if o.SQLiteRedact {
+		cfg.Storage.SQLite.Redact = true
 	}
 
 	if o.UpstreamURL != "" {

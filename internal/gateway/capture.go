@@ -15,11 +15,10 @@ type captureWriter struct {
 	ex     *inspector.Exchange
 	status int
 	wrote  bool
-	redact bool
 }
 
-func newCaptureWriter(w http.ResponseWriter, ex *inspector.Exchange, redact bool) *captureWriter {
-	return &captureWriter{ResponseWriter: w, ex: ex, status: http.StatusOK, redact: redact}
+func newCaptureWriter(w http.ResponseWriter, ex *inspector.Exchange) *captureWriter {
+	return &captureWriter{ResponseWriter: w, ex: ex, status: http.StatusOK}
 }
 
 func (c *captureWriter) WriteHeader(code int) {
@@ -31,9 +30,6 @@ func (c *captureWriter) WriteHeader(code int) {
 	h := c.Header().Clone()
 	ct := h.Get("Content-Type")
 	stream := strings.Contains(ct, "text/event-stream") || strings.Contains(ct, "ndjson")
-	if c.redact {
-		h = inspector.RedactHeaders(h)
-	}
 	c.ex.Update(func(r *inspector.Record) {
 		r.Client.Status = code
 		r.Client.RespHeader = h

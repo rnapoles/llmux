@@ -17,11 +17,18 @@ import (
 	"github.com/rnapoles/llmux/internal/inspector"
 )
 
+// Archiver receives every finished exchange for long-term storage. The record
+// is a private deep copy. Implementations must not block the caller.
+type Archiver interface {
+	Archive(rec inspector.Record)
+}
+
 // Deps are the collaborators injected into the gateway.
 type Deps struct {
 	Dialects DialectSource
 	Backends BackendSource
 	Store    *inspector.Store // optional (nil disables recording)
+	Archive  Archiver         // optional (requires Store); e.g. the SQLite writer
 	Logger   *slog.Logger
 }
 
@@ -29,24 +36,26 @@ type Gateway struct {
 	table   *hostTable
 	vhosts  []*VHost
 	store   *inspector.Store
+	archive Archiver
+	uiLimit int // body bytes kept in memory after archiving
 	log     *slog.Logger
 	maxBody int64
-	redact  bool
 }
 
 // New builds a gateway from configuration.
 func New(cfg config.Config, deps Deps) (*Gateway, error) {
 	g := &Gateway{
 		store:   deps.Store,
+		archive: deps.Archive,
+		uiLimit: cfg.Inspector.BodyLimit.Int(),
 		log:     deps.Logger,
-		maxBody: cfg.Server.MaxBodyBytes,
-		redact:  cfg.Inspector.Redact,
+		maxBody: cfg.Server.MaxBodyBytes.Int64(),
 	}
 	if g.log == nil {
 		g.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	for _, hc := range cfg.Hosts {
-		v, err := newVHost(hc, deps.Dialects, deps.Backends, g.redact)
+		v, err := newVHost(hc, deps.Dialects, deps.Backends)
 		if err != nil {
 			return nil, err
 		}
@@ -71,7 +80,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	ex := g.store.Begin()
-	cw := newCaptureWriter(w, ex, g.redact)
+	cw := newCaptureWriter(w, ex)
 	r = r.WithContext(inspector.WithExchange(r.Context(), ex))
 	defer g.finish(ex, cw, r, start)
 
@@ -117,9 +126,6 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (g *Gateway) recordRequest(ex *inspector.Exchange, r *http.Request, body []byte) {
 	h := r.Header.Clone()
 	h.Set("Host", r.Host)
-	if g.redact {
-		h = inspector.RedactHeaders(h)
-	}
 	var peek struct {
 		Model string `json:"model"`
 	}
@@ -147,6 +153,11 @@ func (g *Gateway) finish(ex *inspector.Exchange, cw *captureWriter, r *http.Requ
 			rec.Prompt, rec.Completion = inspector.ScanUsage(rec.Client.RespBody)
 		}
 	})
+	if g.archive != nil && ex != nil {
+		g.archive.Archive(ex.Snapshot())
+		// The database now owns the full payloads; keep only what the UI needs.
+		ex.Trim(g.uiLimit)
+	}
 	lvl := slog.LevelInfo
 	if cw.status >= 500 {
 		lvl = slog.LevelError

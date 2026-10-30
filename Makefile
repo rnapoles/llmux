@@ -1,10 +1,13 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: build run tui test tidy fmt docker clean
+.PHONY: build build-cgo run tui test tidy fmt docker clean
 
 build:
 	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/llmux ./cmd/llmux
+
+build-cgo:
+	CGO_ENABLED=1 go build -tags mattn -trimpath -ldflags "$(LDFLAGS)" -o bin/llmux ./cmd/llmux
 
 run: build
 	./bin/llmux --config configs/llmux.example.yaml

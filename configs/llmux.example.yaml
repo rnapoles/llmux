@@ -8,7 +8,7 @@ server:
   read_header_timeout: 15s
   idle_timeout: 120s
   shutdown_timeout: 10s
-  max_body_bytes: 33554432       # 32 MiB request limit
+  max_body_bytes: 32m            # request size limit; sizes: 36 | 36b = bytes, 36k, 36m, 36g (binary, 1k = 1024)
   log_level: info                # debug | info | warn | error
   log_file: llmux.log            # only used with --tui (the TUI owns the terminal)
 
@@ -23,8 +23,19 @@ auth:
 inspector:
   enabled: false
   history: 1000                  # exchanges kept in memory
-  body_limit: 1048576            # bytes captured per body
+  body_limit: 1m                 # captured per body (what the TUI keeps); plain number = bytes
   redact: true                   # mask Authorization / x-api-key in captured headers
+
+# Persist every request/response (client leg AND upstream leg, with full headers
+# and bodies) into SQLite for later analysis. Also available as: --sqlite FILE
+storage:
+  sqlite:
+    enabled: false
+    path: llmux.db
+    body_limit: 64m              # max size stored per body
+    redact: false                # true = mask Authorization/x-api-key/cookies in stored headers
+    retention: 0s                # e.g. 720h = delete rows older than 30 days (0 = keep forever)
+    queue_size: 4096             # pending writes; when full, records are dropped, never blocking traffic
 
 # Virtual hosts. The request's Host header selects the entry:
 #   exact name  >  "*.wildcard"  >  "*" (catch-all)

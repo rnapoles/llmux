@@ -175,8 +175,8 @@ func leg(sb *strings.Builder, title, line string, h http.Header, body inspector.
 	}
 	sb.WriteString("\n" + section(fmt.Sprintf("Body · %s", fmtBytes(body.Total)), w))
 	sb.WriteString(indent(renderBody(body, raw), "  "))
-	if body.Truncated {
-		sb.WriteString("\n" + fg(cAmber).Render(fmt.Sprintf("  … truncated: showing first %s of %s", fmtBytes(int64(len(body.Data))), fmtBytes(body.Total))) + "\n")
+	if body.Truncated || len(body.Data) > displayLimit {
+		sb.WriteString("\n" + fg(cAmber).Render(fmt.Sprintf("  … truncated: showing first %s of %s", fmtBytes(int64(min(len(body.Data), displayLimit))), fmtBytes(body.Total))) + "\n")
 	}
 }
 
@@ -188,12 +188,20 @@ func indent(s, pre string) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
+// displayLimit caps what the TUI formats per body; the full payload is still
+// captured (and persisted when SQLite storage is enabled).
+const displayLimit = 1 << 20
+
 // renderBody formats JSON, SSE and NDJSON payloads.
 func renderBody(b inspector.Body, raw bool) string {
 	if b.Total == 0 {
 		return fg(cDim).Render("  (empty)") + "\n"
 	}
-	text := sanitize(string(b.Data))
+	data := b.Data
+	if len(data) > displayLimit {
+		data = data[:displayLimit]
+	}
+	text := sanitize(string(data))
 	if raw {
 		return text + "\n"
 	}

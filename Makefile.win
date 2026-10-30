@@ -26,7 +26,7 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .DEFAULT_GOAL := build
 .PHONY: build run tui test test-fast vet tidy fmt clean docker help \
-        build-linux build-darwin build-all dist
+        build-cgo build-linux build-darwin build-all dist
 
 help:
 	@echo LLMux $(VERSION) - targets:
@@ -37,6 +37,7 @@ help:
 	@echo   test-fast    go vet + go test         (no cgo)
 	@echo   tidy         go mod tidy
 	@echo   fmt          gofmt -w .
+	@echo   build-cgo    build with the mattn/CGO SQLite driver (needs gcc)
 	@echo   build-linux  cross-compile $(BIN_DIR)\$(APP)-linux-amd64
 	@echo   build-darwin cross-compile $(BIN_DIR)\$(APP)-darwin-arm64
 	@echo   build-all    windows + linux + darwin binaries
@@ -77,6 +78,10 @@ fmt:
 	gofmt -w .
 
 # ---- cross compilation ------------------------------------------------------
+
+# Optional: use the mattn/CGO SQLite driver instead of the pure-Go default (needs gcc).
+build-cgo: $(BIN_DIR)
+	set CGO_ENABLED=1&& go build -tags mattn -trimpath -ldflags "$(LDFLAGS)" -o $(EXE) .\cmd\llmux
 
 build-linux: $(BIN_DIR)
 	set CGO_ENABLED=0&& set GOOS=linux&& set GOARCH=amd64&& go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)\$(APP)-linux-amd64 .\cmd\llmux

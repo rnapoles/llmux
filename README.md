@@ -64,11 +64,20 @@ curl localhost:8080/api/chat -d '{"model":"gpt-4","messages":[{"role":"user","co
 | `--remove-header K` | drop an upstream request header (repeatable) |
 | `--forward-header K` | forward *only* these client headers (repeatable, `X-*` patterns) |
 | `--model-map a=b` | rewrite model names (repeatable) |
+| `--sqlite FILE` | persist every exchange (full headers + bodies) into a SQLite database |
+| `--sqlite-redact` | mask credentials in the headers stored in SQLite |
 | `--tui` | interactive inspector |
 | `--log-level L` | `debug`/`info`/`warn`/`error` |
 
 Precedence: defaults < YAML < flags. See [`configs/llmux.example.yaml`](configs/llmux.example.yaml)
 for every YAML option, including `${ENV}` / `${ENV:-default}` expansion.
+
+## Sizes
+
+`server.max_body_bytes`, `inspector.body_limit` and `storage.sqlite.body_limit` take a number with an
+optional unit, matching `\d+(b|B|k|K|m|M|g|G)?`: `36` = `36b` = 36 bytes, `36k` = 36 KiB,
+`36m` = 36 MiB, `36g` = 36 GiB (binary multiples, case-insensitive; no suffix means bytes). Plain YAML
+integers still work, and `${ENV:-32m}` expansion applies as usual.
 
 ## Virtual hosts
 
@@ -135,6 +144,7 @@ internal/
   upstream/          tiny JSON HTTP client used by backends
   gateway/           pipeline: vhost → route → auth → proxy | translate; header policy
   inspector/         bounded recorder of both HTTP legs (nil-safe when disabled)
+  storage/sqlite/    async SQLite archiver (implements gateway.Archiver)
   tui/               Bubble Tea inspector
   config/            YAML + flags → Config
   app/               composition root
@@ -173,6 +183,7 @@ internal/
 ```bash
 make test       # go vet + go test -race ./...
 make build      # static binary in bin/
+make build-cgo  # same, using the mattn/CGO SQLite driver
 make docker     # container image
 ```
 

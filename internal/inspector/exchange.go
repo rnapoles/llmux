@@ -135,6 +135,33 @@ func (e *Exchange) AppendBody(sel func(r *Record) *Body, p []byte) {
 	e.store.touch()
 }
 
+// Trim shrinks every captured body to at most limit bytes (keeping the tail
+// for usage statistics). It is used after a record has been persisted so the
+// in-memory history does not retain very large payloads.
+func (e *Exchange) Trim(limit int) {
+	if e == nil || limit <= 0 {
+		return
+	}
+	e.mu.Lock()
+	for _, b := range []*Body{&e.rec.Client.ReqBody, &e.rec.Client.RespBody, &e.rec.Upstream.ReqBody, &e.rec.Upstream.RespBody} {
+		if len(b.Data) <= limit {
+			continue
+		}
+		if len(b.Tail) == 0 {
+			from := len(b.Data) - tailSize
+			if from < 0 {
+				from = 0
+			}
+			b.Tail = append([]byte(nil), b.Data[from:]...)
+		}
+		b.Data = append([]byte(nil), b.Data[:limit]...)
+		b.Truncated = true
+	}
+	e.mu.Unlock()
+	e.rev.Add(1)
+	e.store.touch()
+}
+
 // Snapshot returns a deep copy safe to use without locking.
 func (e *Exchange) Snapshot() Record {
 	e.mu.RLock()
