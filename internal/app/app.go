@@ -20,6 +20,7 @@ import (
 	"github.com/rnapoles/llmux/internal/dialect"
 	"github.com/rnapoles/llmux/internal/gateway"
 	"github.com/rnapoles/llmux/internal/inspector"
+	sqlitestore "github.com/rnapoles/llmux/internal/storage/sqlite"
 	"github.com/rnapoles/llmux/internal/tui"
 )
 
@@ -31,15 +32,45 @@ func Run(cfg config.Config, version string) error {
 	}
 	defer closeLog()
 
-	var store *inspector.Store
-	if cfg.TUI || cfg.Inspector.Enabled {
-		store = inspector.NewStore(cfg.Inspector.History, cfg.Inspector.BodyLimit)
+	// Recording is needed by the TUI, by the inspector option and by persistence.
+	sq := cfg.Storage.SQLite
+	var (
+		store   *inspector.Store
+		archive gateway.Archiver
+	)
+	if cfg.TUI || cfg.Inspector.Enabled || sq.Enabled {
+		history, limit := cfg.Inspector.History, cfg.Inspector.BodyLimit.Int()
+		if !cfg.TUI && !cfg.Inspector.Enabled {
+			history = 1 // headless: nothing browses the in-memory history
+		}
+		if sq.Enabled && sq.BodyLimit.Int() > limit {
+			limit = sq.BodyLimit.Int() // capture enough for the database
+		}
+		store = inspector.NewStore(history, limit)
+	}
+	if sq.Enabled {
+		db, err := sqlitestore.Open(sqlitestore.Options{
+			Path: sq.Path, QueueSize: sq.QueueSize, Redact: sq.Redact, Retention: sq.Retention, Logger: logger,
+		})
+		if err != nil {
+			return err
+		}
+		// Deferred before the server shutdown below, so it runs *after* in-flight
+		// requests have finished and enqueued their records: nothing is lost.
+		defer func() {
+			if err := db.Close(); err != nil {
+				logger.Error("closing sqlite", "err", err)
+			}
+		}()
+		archive = db
+		logger.Info("persisting exchanges", "sqlite", sq.Path, "body_limit", sq.BodyLimit.String(), "redact", sq.Redact)
 	}
 
 	gw, err := gateway.New(cfg, gateway.Deps{
 		Dialects: dialect.Default(),
 		Backends: backend.Default(),
 		Store:    store,
+		Archive:  archive,
 		Logger:   logger,
 	})
 	if err != nil {
@@ -76,7 +107,10 @@ func Run(cfg config.Config, version string) error {
 
 	if cfg.TUI {
 		defer shutdown()
-		info := tui.Info{Version: version, Listen: ln.Addr().String()}
+		info := tui.Info{Version: version, Listen: ln.Addr().String(), Redact: cfg.Inspector.Redact}
+		if sq.Enabled {
+			info.Persist = sq.Path
+		}
 		for _, v := range gw.VHosts() {
 			names := make([]string, 0, len(v.Dialects))
 			for _, d := range v.Dialects {
@@ -132,6 +166,9 @@ func printBanner(cfg config.Config, gw *gateway.Gateway, addr, version string) {
 		}
 		fmt.Fprintf(os.Stderr, "  %-14s %s  ⇄  %s (%s)\n", v.Name, strings.Join(ds, "+"), v.Backend.Endpoint(), v.Backend.Name())
 		fmt.Fprintf(os.Stderr, "  %-14s hosts: %s\n", "", strings.Join(v.Patterns, ", "))
+	}
+	if sq := cfg.Storage.SQLite; sq.Enabled {
+		fmt.Fprintf(os.Stderr, "\n  persisting every exchange to SQLite: %s\n", sq.Path)
 	}
 	fmt.Fprintf(os.Stderr, "\n  health: http://%s/healthz   (Ctrl+C to stop)\n\n", addr)
 }

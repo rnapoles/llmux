@@ -34,4 +34,7 @@ go.work.sum
 # Custom
 bin/
 *.log
+*.db
+*.sqlite
+*.sqlite3
 #llmux.yaml

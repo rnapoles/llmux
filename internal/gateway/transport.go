@@ -10,8 +10,7 @@ import (
 // inspectTransport records the LLMux→upstream leg of every exchange whose
 // context carries an *inspector.Exchange.
 type inspectTransport struct {
-	base   http.RoundTripper
-	redact bool
+	base http.RoundTripper
 }
 
 func (t *inspectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -20,9 +19,6 @@ func (t *inspectTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return t.base.RoundTrip(req)
 	}
 	h := req.Header.Clone()
-	if t.redact {
-		h = inspector.RedactHeaders(h)
-	}
 	ex.Update(func(r *inspector.Record) {
 		r.Upstream.Method = req.Method
 		r.Upstream.URL = req.URL.String()
@@ -40,9 +36,6 @@ func (t *inspectTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		return nil, err
 	}
 	rh := resp.Header.Clone()
-	if t.redact {
-		rh = inspector.RedactHeaders(rh)
-	}
 	ex.Update(func(r *inspector.Record) {
 		r.Upstream.Status = resp.StatusCode
 		r.Upstream.RespHeader = rh

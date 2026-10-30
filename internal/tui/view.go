@@ -60,6 +60,9 @@ func (m *model) header() string {
 		on(bg, cDim, false, " v"+m.info.Version) + gap(bg, 2) +
 		on(bg, cGreen, true, "●") + on(bg, cMute, false, " "+m.info.Listen) +
 		on(bg, cDim, false, fmt.Sprintf("  %d host(s)", len(m.info.Hosts)))
+	if m.info.Persist != "" && m.w >= 120 {
+		left += gap(bg, 2) + on(bg, cViolet, true, "⛁ ") + on(bg, cMute, false, trunc(m.info.Persist, 24))
+	}
 
 	live := on(bg, cGreen, true, "● LIVE")
 	if m.paused {

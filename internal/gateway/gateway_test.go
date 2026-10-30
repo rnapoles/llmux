@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rnapoles/llmux/internal/backend"
 	"github.com/rnapoles/llmux/internal/config"
@@ -95,6 +96,35 @@ func newGateway(t *testing.T, hosts ...config.Host) (*httptest.Server, *inspecto
 	return srv, store
 }
 
+// eventually polls cond: records are finalised (usage, archiving) just after the
+// response has been flushed, so tests must not read them immediately.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func waitDone(t *testing.T, store *inspector.Store, n int) {
+	t.Helper()
+	eventually(t, "exchanges to finish", func() bool {
+		l := store.List()
+		if len(l) < n {
+			return false
+		}
+		for _, e := range l {
+			if !e.Summary().Done {
+				return false
+			}
+		}
+		return true
+	})
+}
+
 func do(t *testing.T, method, url, body string, hdr map[string]string) (*http.Response, string) {
 	t.Helper()
 	req, _ := http.NewRequest(method, url, strings.NewReader(body))
@@ -164,12 +194,17 @@ func TestProxyHeadersAuthModelMap(t *testing.T) {
 	}
 
 	// inspector captured both legs and usage
+	waitDone(t, store, 2)
 	rec := store.List()[1].Snapshot()
 	if rec.Mode != "proxy" || rec.Upstream.Status != 200 || rec.Prompt != 3 || rec.Completion != 2 {
 		t.Errorf("bad record: mode=%s up=%d usage=%d/%d", rec.Mode, rec.Upstream.Status, rec.Prompt, rec.Completion)
 	}
-	if !strings.Contains(rec.Upstream.ReqHeader.Get("Authorization"), "••") {
-		t.Errorf("upstream auth header should be redacted in the inspector")
+	// Capture is raw; masking happens where it is displayed or stored.
+	if rec.Upstream.ReqHeader.Get("Authorization") != "Bearer upstream-secret" {
+		t.Errorf("inspector must capture the real upstream header, got %q", rec.Upstream.ReqHeader.Get("Authorization"))
+	}
+	if !strings.Contains(inspector.RedactHeaders(rec.Upstream.ReqHeader).Get("Authorization"), "••") {
+		t.Errorf("RedactHeaders should mask the credential")
 	}
 }
 
@@ -207,6 +242,7 @@ func TestOllamaClientToOpenAIUpstream(t *testing.T) {
 	if body != "Ollama is running" {
 		t.Fatalf("root: %q", body)
 	}
+	waitDone(t, store, 4)
 	if rec := store.List()[1].Snapshot(); rec.Mode != "translate" || !rec.Stream {
 		t.Errorf("record: mode=%s stream=%v", rec.Mode, rec.Stream)
 	}
@@ -287,8 +323,64 @@ func TestPassthroughStreaming(t *testing.T) {
 	if !strings.Contains(body, "[DONE]") {
 		t.Fatalf("body: %s", body)
 	}
+	waitDone(t, store, 1)
 	rec := store.List()[0].Snapshot()
 	if !rec.Stream || rec.Prompt != 3 || rec.Completion != 2 {
 		t.Errorf("stream=%v usage=%d/%d", rec.Stream, rec.Prompt, rec.Completion)
+	}
+}
+
+type memArchive struct{ ch chan inspector.Record }
+
+func (m *memArchive) Archive(r inspector.Record) { m.ch <- r }
+
+func TestArchiverReceivesFullRecordAndMemoryIsTrimmed(t *testing.T) {
+	up := fakeOpenAI(t, nil, nil)
+	defer up.Close()
+
+	cfg := config.Default()
+	cfg.Inspector.BodyLimit = 16 // what the UI keeps in memory afterwards
+	cfg.Hosts = []config.Host{{Name: "x", Dialects: []string{"openai"}, Upstream: config.Upstream{Type: "openai", URL: up.URL, APIKey: "k"}}}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	store := inspector.NewStore(10, 1<<20) // capture limit larger than the UI limit
+	arch := &memArchive{ch: make(chan inspector.Record, 4)}
+	gw, err := gateway.New(cfg, gateway.Deps{Dialects: dialect.Default(), Backends: backend.Default(), Store: store, Archive: arch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	do(t, "POST", srv.URL+"/v1/chat/completions", `{"model":"m","messages":[{"role":"user","content":"a fairly long prompt"}]}`,
+		map[string]string{"Authorization": "Bearer client", "Content-Type": "application/json"})
+
+	var r inspector.Record
+	select {
+	case r = <-arch.ch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("record was never archived")
+	}
+	if !r.Done || r.Client.Status != 200 || r.Upstream.Status != 200 {
+		t.Errorf("incomplete record: done=%v client=%d up=%d", r.Done, r.Client.Status, r.Upstream.Status)
+	}
+	if r.Client.ReqHeader.Get("Authorization") != "Bearer client" || r.Upstream.ReqHeader.Get("Authorization") != "Bearer k" {
+		t.Errorf("full headers expected: %v / %v", r.Client.ReqHeader, r.Upstream.ReqHeader)
+	}
+	if !strings.Contains(string(r.Client.ReqBody.Data), "a fairly long prompt") || !strings.Contains(string(r.Client.RespBody.Data), "Hello") ||
+		!strings.Contains(string(r.Upstream.RespBody.Data), "Hello") {
+		t.Errorf("full bodies expected")
+	}
+	// in-memory copy shrank to the UI limit, but usage stats survive
+	eventually(t, "memory trim", func() bool {
+		return len(store.List()[0].Snapshot().Client.ReqBody.Data) == 16
+	})
+	live := store.List()[0].Snapshot()
+	if len(live.Client.ReqBody.Data) != 16 || !live.Client.ReqBody.Truncated {
+		t.Errorf("memory not trimmed: %d bytes", len(live.Client.ReqBody.Data))
+	}
+	if live.Prompt != 3 || live.Completion != 2 {
+		t.Errorf("usage lost: %d/%d", live.Prompt, live.Completion)
 	}
 }

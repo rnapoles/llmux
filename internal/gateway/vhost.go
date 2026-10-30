@@ -41,7 +41,7 @@ type VHost struct {
 	Transport http.RoundTripper
 }
 
-func newVHost(cfg config.Host, dialects DialectSource, backends BackendSource, redact bool) (*VHost, error) {
+func newVHost(cfg config.Host, dialects DialectSource, backends BackendSource) (*VHost, error) {
 	names := cfg.Dialects
 	if len(names) == 0 {
 		names = dialects.Names()
@@ -68,7 +68,7 @@ func newVHost(cfg config.Host, dialects DialectSource, backends BackendSource, r
 	if cfg.Upstream.InsecureSkipVerify {
 		base.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // explicit opt-in
 	}
-	v.Transport = &inspectTransport{base: base, redact: redact}
+	v.Transport = &inspectTransport{base: base}
 
 	u, _ := url.Parse(cfg.Upstream.URL)
 	u.Path = strings.TrimSuffix(strings.TrimRight(u.Path, "/"), "/v1")

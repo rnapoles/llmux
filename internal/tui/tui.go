@@ -22,6 +22,8 @@ type Info struct {
 	Version string
 	Listen  string
 	Hosts   []HostInfo
+	Persist string // SQLite path when persistence is on
+	Redact  bool   // mask credentials in displayed headers
 }
 
 // Run shows the TUI until the user quits or the server fails (errc).

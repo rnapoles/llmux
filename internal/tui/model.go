@@ -257,7 +257,14 @@ func (m *model) updateDetail(force bool) {
 	if id != m.detailID {
 		m.detailID, m.dOff = id, 0
 	}
-	m.detail = buildDetail(ex.Snapshot(), m.tab, m.raw, m.wrap, m.detailW()-1)
+	rec := ex.Snapshot()
+	if m.info.Redact {
+		rec.Client.ReqHeader = inspector.RedactHeaders(rec.Client.ReqHeader)
+		rec.Client.RespHeader = inspector.RedactHeaders(rec.Client.RespHeader)
+		rec.Upstream.ReqHeader = inspector.RedactHeaders(rec.Upstream.ReqHeader)
+		rec.Upstream.RespHeader = inspector.RedactHeaders(rec.Upstream.RespHeader)
+	}
+	m.detail = buildDetail(rec, m.tab, m.raw, m.wrap, m.detailW()-1)
 	m.clampDetail()
 }
 
