@@ -63,13 +63,7 @@ func buildDetail(rec inspector.Record, tab tabID, raw, wrap bool, w int) []strin
 		}
 		leg(&sb, "Upstream → LLMux", status, rec.Upstream.RespHeader, rec.Upstream.RespBody, raw, w, true)
 	}
-	text := strings.TrimRight(sb.String(), "\n")
-	if wrap {
-		text = lipgloss.NewStyle().Width(w).Render(text)
-	} else {
-		text = lipgloss.NewStyle().MaxWidth(w).Render(text)
-	}
-	return strings.Split(text, "\n")
+	return wrapText(strings.TrimRight(sb.String(), "\n"), w, wrap)
 }
 
 func section(title string, w int) string {
@@ -129,6 +123,9 @@ func overview(sb *strings.Builder, r inspector.Record, w int) {
 	}
 
 	turns := requestTurns(r.Client.ReqBody.Data)
+	for i := range turns {
+		turns[i].role = inline(turns[i].role)
+	}
 	if reply := responseText(r.Client.RespBody); reply != "" {
 		turns = append(turns, turn{"assistant", reply})
 	}
@@ -175,7 +172,7 @@ func leg(sb *strings.Builder, title, line string, h http.Header, body inspector.
 	}
 	sb.WriteString("\n" + section(fmt.Sprintf("Body · %s", fmtBytes(body.Total)), w))
 	sb.WriteString(indent(renderBody(body, raw), "  "))
-	if body.Truncated || len(body.Data) > displayLimit {
+	if body.Truncated || int64(len(body.Data)) < body.Total || len(body.Data) > displayLimit {
 		sb.WriteString("\n" + fg(cAmber).Render(fmt.Sprintf("  … truncated: showing first %s of %s", fmtBytes(int64(min(len(body.Data), displayLimit))), fmtBytes(body.Total))) + "\n")
 	}
 }

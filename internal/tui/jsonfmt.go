@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strings"
+	"unicode/utf8"
 )
 
 // Highlighting uses raw 256-colour SGR codes: they are fast to emit for
@@ -18,21 +19,104 @@ const (
 	sgrDim     = "\x1b[38;5;242m"
 )
 
-// sanitize removes control characters (notably ESC) so untrusted payloads
-// cannot manipulate the terminal.
-func sanitize(s string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r == '\n':
-			return r
-		case r == '\t':
-			return ' '
-		case r < 0x20 || r == 0x7f:
-			return -1
-		}
-		return r
-	}, s)
+// unsafeRune reports runes that are removed from anything shown on screen:
+// control characters (notably ESC, which could drive the terminal), zero-width
+// and joiner characters, variation selectors, bidi controls and line/paragraph
+// separators. Terminals and Go's width tables disagree about how wide these
+// are, and a single disagreement makes the terminal wrap a row and tear the
+// whole layout apart.
+func unsafeRune(r rune) bool {
+	switch {
+	case r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f):
+		return true
+	case r == 0x00ad || r == 0x034f || r == 0x061c || r == 0x180e:
+		return true
+	case r >= 0x200b && r <= 0x200f, // zero-width space, ZWNJ, ZWJ, LRM, RLM
+		r == 0x2028 || r == 0x2029,
+		r >= 0x202a && r <= 0x202e, // bidi embeddings / overrides
+		r >= 0x2060 && r <= 0x206f, // word joiner, invisible operators, bidi isolates
+		r >= 0xfe00 && r <= 0xfe0f, // variation selectors (VS16 emoji presentation)
+		r == 0xfeff,
+		r >= 0xfff9 && r <= 0xfffb,
+		r >= 0xe0000 && r <= 0xe007f, // tag characters
+		r >= 0xe0100 && r <= 0xe01ef:
+		return true
+	}
+	return false
 }
+
+func isRegionalIndicator(r rune) bool { return r >= 0x1f1e6 && r <= 0x1f1ff }
+
+// clean is the single text filter for display. Newlines survive only when
+// keepNL is set; flag emoji (pairs of regional indicators, whose width varies
+// between terminals) become plain "[US]"-style text.
+func clean(s string, keepNL bool) string {
+	// Fast path: printable ASCII (plus newline when kept) needs no work at all.
+	i := 0
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c >= 0x7f {
+			if !(c == '\n' && keepNL) {
+				break
+			}
+		}
+	}
+	if i == len(s) {
+		return s
+	}
+
+	var sb strings.Builder
+	sb.Grow(len(s))
+	sb.WriteString(s[:i])
+	for i < len(s) {
+		c := s[i]
+		if c < utf8.RuneSelf { // ASCII
+			switch {
+			case c == '\n':
+				if keepNL {
+					sb.WriteByte('\n')
+				} else {
+					sb.WriteByte(' ')
+				}
+			case c == '\t':
+				sb.WriteByte(' ')
+			case c < 0x20 || c == 0x7f:
+				// dropped
+			default:
+				sb.WriteByte(c)
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case isRegionalIndicator(r):
+			sb.WriteByte('[')
+			sb.WriteRune('A' + (r - 0x1f1e6))
+			i += size
+			if i < len(s) {
+				if r2, sz2 := utf8.DecodeRuneInString(s[i:]); isRegionalIndicator(r2) {
+					sb.WriteRune('A' + (r2 - 0x1f1e6))
+					i += sz2
+				}
+			}
+			sb.WriteByte(']')
+			continue
+		case unsafeRune(r):
+			// dropped
+		case r == utf8.RuneError && size == 1:
+			sb.WriteRune(utf8.RuneError) // invalid byte -> U+FFFD, never emitted raw
+		default:
+			sb.WriteString(s[i : i+size])
+		}
+		i += size
+	}
+	return sb.String()
+}
+
+// sanitize cleans multi-line text (bodies); inline cleans single-line fields.
+func sanitize(s string) string { return clean(s, true) }
+func inline(s string) string   { return clean(s, false) }
 
 // colorizeJSON highlights JSON (or JSON-ish) text. It is tolerant: invalid or
 // truncated input is highlighted as far as it parses.

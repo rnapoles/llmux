@@ -40,9 +40,13 @@ func (b *Body) append(p []byte, limit int) {
 	}
 }
 
-func (b Body) clone() Body {
+func (b Body) cloneLimit(max int) Body {
+	data := b.Data
+	if max >= 0 && len(data) > max {
+		data = data[:max]
+	}
 	return Body{
-		Data:      append([]byte(nil), b.Data...),
+		Data:      append([]byte(nil), data...),
 		Tail:      append([]byte(nil), b.Tail...),
 		Total:     b.Total,
 		Truncated: b.Truncated,
@@ -163,7 +167,12 @@ func (e *Exchange) Trim(limit int) {
 }
 
 // Snapshot returns a deep copy safe to use without locking.
-func (e *Exchange) Snapshot() Record {
+func (e *Exchange) Snapshot() Record { return e.SnapshotLimit(-1) }
+
+// SnapshotLimit is Snapshot, but copies at most max bytes of each body (the
+// head; Total still reports the real size). Viewers that only display a prefix
+// avoid copying megabytes on every refresh. max < 0 means no limit.
+func (e *Exchange) SnapshotLimit(max int) Record {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	r := e.rec
@@ -171,10 +180,10 @@ func (e *Exchange) Snapshot() Record {
 	r.Client.RespHeader = e.rec.Client.RespHeader.Clone()
 	r.Upstream.ReqHeader = e.rec.Upstream.ReqHeader.Clone()
 	r.Upstream.RespHeader = e.rec.Upstream.RespHeader.Clone()
-	r.Client.ReqBody = e.rec.Client.ReqBody.clone()
-	r.Client.RespBody = e.rec.Client.RespBody.clone()
-	r.Upstream.ReqBody = e.rec.Upstream.ReqBody.clone()
-	r.Upstream.RespBody = e.rec.Upstream.RespBody.clone()
+	r.Client.ReqBody = e.rec.Client.ReqBody.cloneLimit(max)
+	r.Client.RespBody = e.rec.Client.RespBody.cloneLimit(max)
+	r.Upstream.ReqBody = e.rec.Upstream.ReqBody.cloneLimit(max)
+	r.Upstream.RespBody = e.rec.Upstream.RespBody.cloneLimit(max)
 	return r
 }
 

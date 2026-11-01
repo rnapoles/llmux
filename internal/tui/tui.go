@@ -2,6 +2,9 @@
 package tui
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -38,6 +41,11 @@ func Run(store *inspector.Store, info Info, errc <-chan error) error {
 			p.Send(serverErrMsg{err})
 		}
 	}()
+	// DECAWM off: if a terminal ever disagrees with us about a character's
+	// width, the overflow is clipped instead of wrapping onto a new row, which
+	// would push the whole frame down and scroll the header off screen.
+	fmt.Fprint(os.Stdout, "\x1b[?7l")
+	defer fmt.Fprint(os.Stdout, "\x1b[?7h")
 	_, err := p.Run()
 	if err != nil {
 		return err

@@ -33,6 +33,14 @@ var statusFilterNames = [sfCount]string{"ALL", "2xx", "ERR", "STREAM"}
 type (
 	tickMsg      time.Time
 	serverErrMsg struct{ err error }
+	buildMsg     struct{ seq int } // debounce timer for a heavy detail build
+)
+
+const (
+	cacheEntries   = 24
+	cheapBuild     = 12 * time.Millisecond // builds faster than this run immediately
+	buildDebounce  = 70 * time.Millisecond
+	liveRebuildGap = 250 * time.Millisecond
 )
 
 type stats struct {
@@ -74,8 +82,18 @@ type model struct {
 
 	detail    []string
 	dOff      int
-	detailKey string
+	detailKey string // identity of what m.detail shows, including the exchange revision
+	viewKey   string // same, without the revision (to spot "same view, new data")
 	detailID  uint64
+
+	// Rendering performance (see updateDetail / requestDetail).
+	cache      map[string][]string // finished exchanges only
+	cacheOrder []string
+	builtAt    time.Time
+	lastBuild  time.Duration
+	stale      bool // a deferred build is pending: show a placeholder
+	navSeq     int
+	cmd        tea.Cmd
 }
 
 func newModel(store *inspector.Store, info Info) *model {
@@ -89,7 +107,7 @@ func newModel(store *inspector.Store, info Info) *model {
 			}
 		}
 	}
-	return &model{store: store, info: info, follow: true, wrap: true, dialects: ds, lastVer: ^uint64(0)}
+	return &model{store: store, info: info, follow: true, wrap: true, dialects: ds, lastVer: ^uint64(0), cache: map[string][]string{}}
 }
 
 func tick() tea.Cmd {
@@ -187,7 +205,7 @@ func (m *model) refresh(force bool) {
 	rows := make([]inspector.Summary, 0, len(all))
 	exs := make([]*inspector.Exchange, 0, len(all))
 	for i := len(all) - 1; i >= 0; i-- { // newest first
-		s := all[i].Summary()
+		s := cleanSummary(all[i].Summary())
 		st.total++
 		if s.Error {
 			st.errors++
@@ -220,7 +238,11 @@ func (m *model) refresh(force bool) {
 		}
 	}
 	m.clamp()
-	m.updateDetail(false)
+	if m.selectedID() != m.detailID {
+		m.requestDetail()
+	} else {
+		m.updateDetail(false)
+	}
 }
 
 func (m *model) clamp() {
@@ -242,30 +264,102 @@ func (m *model) clamp() {
 	}
 }
 
+// keys identify the detail view of row i: view ignores the exchange revision.
+func (m *model) keys(i int) (view, key string) {
+	view = fmt.Sprintf("%d/%d/%v/%v/%d/%v", m.rows[i].ID, m.tab, m.raw, m.wrap, m.detailW(), m.info.Redact)
+	return view, fmt.Sprintf("%s/%d", view, m.exs[i].Rev())
+}
+
+func (m *model) remember(key string, lines []string) {
+	if _, ok := m.cache[key]; !ok {
+		m.cacheOrder = append(m.cacheOrder, key)
+		if len(m.cacheOrder) > cacheEntries {
+			delete(m.cache, m.cacheOrder[0])
+			m.cacheOrder = m.cacheOrder[1:]
+		}
+	}
+	m.cache[key] = lines
+}
+
+func (m *model) dropCache() {
+	m.cache, m.cacheOrder = map[string][]string{}, nil
+	m.detailKey, m.viewKey = "", ""
+}
+
+// updateDetail brings m.detail in line with the selected row.
+//
+//   - unchanged view: nothing to do;
+//   - finished exchange seen before: served from the cache;
+//   - live exchange: re-rendered at most a few times per second;
+//   - otherwise rendered now (force bypasses the throttles).
 func (m *model) updateDetail(force bool) {
-	if m.cursor >= len(m.exs) || len(m.exs) == 0 {
-		m.detail, m.detailKey = nil, ""
+	if len(m.exs) == 0 || m.cursor >= len(m.exs) {
+		m.detail, m.detailKey, m.viewKey, m.stale = nil, "", "", false
 		return
 	}
-	ex := m.exs[m.cursor]
+	if m.stale && !force {
+		return // a debounced build is on its way
+	}
+	view, key := m.keys(m.cursor)
 	id := m.rows[m.cursor].ID
-	key := fmt.Sprintf("%d/%d/%d/%v/%v/%d", id, ex.Rev(), m.tab, m.raw, m.wrap, m.detailW())
 	if !force && key == m.detailKey {
 		return
 	}
-	m.detailKey = key
 	if id != m.detailID {
 		m.detailID, m.dOff = id, 0
 	}
-	rec := ex.Snapshot()
+	if lines, ok := m.cache[key]; ok {
+		m.detail, m.detailKey, m.viewKey, m.stale = lines, key, view, false
+		m.clampDetail()
+		return
+	}
+	done := m.rows[m.cursor].Done
+	if !force && !done && view == m.viewKey && time.Since(m.builtAt) < liveRebuildGap {
+		return
+	}
+
+	t0 := time.Now()
+	rec := cleanRecord(m.exs[m.cursor].SnapshotLimit(displayLimit))
 	if m.info.Redact {
 		rec.Client.ReqHeader = inspector.RedactHeaders(rec.Client.ReqHeader)
 		rec.Client.RespHeader = inspector.RedactHeaders(rec.Client.RespHeader)
 		rec.Upstream.ReqHeader = inspector.RedactHeaders(rec.Upstream.ReqHeader)
 		rec.Upstream.RespHeader = inspector.RedactHeaders(rec.Upstream.RespHeader)
 	}
-	m.detail = buildDetail(rec, m.tab, m.raw, m.wrap, m.detailW()-1)
+	lines := buildDetail(rec, m.tab, m.raw, m.wrap, m.detailW()-1)
+	m.lastBuild, m.builtAt = time.Since(t0), time.Now()
+	m.detail, m.detailKey, m.viewKey, m.stale = lines, key, view, false
+	if done {
+		m.remember(key, lines)
+	}
 	m.clampDetail()
+}
+
+// requestDetail is updateDetail for selection changes. Cheap or cached views
+// appear instantly; when the last build was heavy (long texts), rapid
+// navigation (a held arrow key) shows a placeholder and renders only once the
+// selection has settled, instead of queueing one slow build per key repeat.
+func (m *model) requestDetail() {
+	if len(m.exs) == 0 || m.cursor >= len(m.exs) {
+		m.updateDetail(true)
+		return
+	}
+	_, key := m.keys(m.cursor)
+	if _, hit := m.cache[key]; hit || m.lastBuild < cheapBuild {
+		m.stale = false
+		m.updateDetail(false)
+		return
+	}
+	m.stale = true
+	m.navSeq++
+	seq := m.navSeq
+	m.cmd = tea.Tick(buildDebounce, func(time.Time) tea.Msg { return buildMsg{seq} })
+}
+
+func (m *model) takeCmd() tea.Cmd {
+	c := m.cmd
+	m.cmd = nil
+	return c
 }
 
 func (m *model) clampDetail() {
@@ -286,7 +380,7 @@ func (m *model) move(delta int) {
 	m.follow = false
 	m.clamp()
 	m.dOff = 0
-	m.updateDetail(false)
+	m.requestDetail()
 }
 
 func (m *model) scrollDetail(delta int) {
@@ -307,22 +401,42 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.frame++
 		m.refresh(false)
-		return m, tick()
+		return m, tea.Batch(tick(), m.takeCmd())
+	case buildMsg:
+		if msg.seq == m.navSeq && m.stale {
+			m.updateDetail(true)
+		}
 	case serverErrMsg:
 		m.fatal = msg.err
 		return m, tea.Quit
 	case tea.KeyMsg:
-		return m.onKey(msg)
+		mm, cmd := m.onKey(msg)
+		return mm, tea.Batch(cmd, m.takeCmd())
 	case tea.MouseMsg:
 		m.onMouse(msg)
 	}
-	return m, nil
+	return m, m.takeCmd()
 }
 
 func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	s := msg.String()
 	if s == "ctrl+c" {
 		return m, tea.Quit
+	}
+	// Bubble Tea delivers keys that arrive in the same read (a held arrow key
+	// while the app is busy) as ONE message such as "jjjj". Replay them one by
+	// one so no keystroke is lost. Pasted text must never trigger shortcuts
+	// (a stray "q" would quit), so outside the filter box it is ignored.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && m.focus != paneFilter {
+		if msg.Paste {
+			return m, nil
+		}
+		var cmds []tea.Cmd
+		for _, r := range msg.Runes {
+			_, c := m.onKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+			cmds = append(cmds, c)
+		}
+		return m, tea.Batch(cmds...)
 	}
 	if m.showHelp {
 		switch s {
@@ -405,7 +519,7 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.follow = true
 			m.cursor = 0
 			m.clamp()
-			m.updateDetail(false)
+			m.requestDetail()
 		}
 	case "end", "G":
 		if m.focus == paneDetail {
@@ -441,7 +555,7 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.follow {
 			m.cursor = 0
 			m.clamp()
-			m.updateDetail(false)
+			m.requestDetail()
 		}
 	}
 	return m, nil
@@ -501,7 +615,7 @@ func (m *model) togglePause() {
 func (m *model) clear() {
 	m.store.Clear()
 	m.rows, m.exs, m.detail, m.cursor, m.offset = nil, nil, nil, 0, 0
-	m.detailKey = ""
+	m.dropCache()
 	m.stats = stats{}
 	m.follow = true
 	m.refresh(true)
@@ -527,7 +641,7 @@ func (m *model) act(a string) {
 		if m.follow {
 			m.cursor = 0
 			m.clamp()
-			m.updateDetail(false)
+			m.requestDetail()
 		}
 	case a == "help":
 		m.showHelp = true
@@ -582,7 +696,7 @@ func (m *model) onMouse(msg tea.MouseMsg) {
 			m.cursor = idx
 			m.follow = false
 			m.dOff = 0
-			m.updateDetail(false)
+			m.requestDetail()
 		}
 	case !inList && msg.Y == 3: // tab strip
 		m.focus = paneDetail
