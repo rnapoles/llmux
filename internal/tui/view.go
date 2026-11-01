@@ -39,15 +39,12 @@ func (m *model) View() string {
 		return "\n  LLMux needs at least 60×12 terminal cells.\n"
 	}
 	if m.showHelp {
-		return strings.Join([]string{
-			m.header(),
+		return m.compose(m.header(),
 			lipgloss.Place(m.w, m.h-2, lipgloss.Center, lipgloss.Center, m.helpBox()),
-			m.statusBar(),
-		}, "\n")
+			m.statusBar())
 	}
 	tb, _ := m.toolbar()
-	body := lipgloss.JoinHorizontal(lipgloss.Top, m.listPanel(), m.detailPanel())
-	return strings.Join([]string{m.header(), tb, body, m.statusBar()}, "\n")
+	return m.compose(m.header(), tb, m.body(), m.statusBar())
 }
 
 // ---------------------------------------------------------------------------
@@ -193,15 +190,59 @@ func (m *model) buildToolbar(compact bool) (string, []hit) {
 // List panel
 // ---------------------------------------------------------------------------
 
-func borderBox(lines []string, focused bool) string {
-	c := cBorder
-	if focused {
-		c = cAccent
+// col moves the cursor to an absolute 1-based column. Every structural glyph
+// (panel borders, scrollbar) is preceded by one, so even if the terminal
+// measures some text differently from us, the frame's skeleton stays put and
+// the discrepancy is confined to that one line of content.
+func col(n int) string { return fmt.Sprintf("\x1b[%dG", n) }
+
+// body draws the two bordered panels side by side. Each row is fully
+// anchored; nothing here depends on the width of user content.
+func (m *model) body() string {
+	lw, rw := m.leftW(), m.w-m.leftW()
+	lc, rc := cBorder, cBorder
+	if m.focus == paneDetail {
+		rc = cAccent
+	} else {
+		lc = cAccent
 	}
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(c).Render(strings.Join(lines, "\n"))
+	ls, rs := fg(lc), fg(rc)
+	left, right := m.listPanel(), m.detailPanel()
+
+	rows := make([]string, 0, m.panelH())
+	rows = append(rows, ls.Render("╭"+strings.Repeat("─", lw-2)+"╮")+col(lw+1)+rs.Render("╭"+strings.Repeat("─", rw-2)+"╮"))
+	for i := 0; i < m.panelH()-2; i++ {
+		rows = append(rows, ls.Render("│")+left[i]+col(lw)+ls.Render("│")+
+			col(lw+1)+rs.Render("│")+right[i]+col(m.w)+rs.Render("│"))
+	}
+	rows = append(rows, ls.Render("╰"+strings.Repeat("─", lw-2)+"╯")+col(lw+1)+rs.Render("╰"+strings.Repeat("─", rw-2)+"╯"))
+	return strings.Join(rows, "\n")
 }
 
-func (m *model) listPanel() string {
+// compose stacks the sections and enforces the invariant the terminal needs:
+// exactly m.h lines, none of them containing a stray line break.
+func (m *model) compose(parts ...string) string {
+	lines := strings.Split(strings.Join(parts, "\n"), "\n")
+	switch {
+	case len(lines) > m.h:
+		// too tall (e.g. the help box on a tiny terminal): clip the middle,
+		// always keep the first rows and the status bar
+		last := lines[len(lines)-1]
+		lines = append(lines[:m.h-1:m.h-1], last)
+	case len(lines) < m.h:
+		for len(lines) < m.h {
+			lines = append(lines[:len(lines)-1], "", lines[len(lines)-1])
+		}
+	}
+	for i, l := range lines { // last line of defence: nothing may exceed the terminal width
+		if lipgloss.Width(l) > m.w {
+			lines[i] = lipgloss.NewStyle().MaxWidth(m.w).Render(l)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *model) listPanel() []string {
 	inner := m.leftW() - 2
 	rowsH := m.panelH() - 2
 	lines := make([]string, 0, rowsH)
@@ -224,7 +265,7 @@ func (m *model) listPanel() string {
 	for i := range lines {
 		lines[i] = fit(lines[i], inner)
 	}
-	return borderBox(lines[:rowsH], m.focus != paneDetail)
+	return lines[:rowsH]
 }
 
 func gapPlain(n int) string {
@@ -356,15 +397,18 @@ func (m *model) tabHits() []hit {
 	return h
 }
 
-func (m *model) detailPanel() string {
+func (m *model) detailPanel() []string {
 	inner := m.detailW()
 	h := m.detailH()
 	tabs, _ := m.tabStrip()
-	lines := []string{fit(" "+tabs, inner)}
+	lines := []string{fit(" "+tabs, inner-1) + col(m.w-1) + " "}
 
-	if len(m.detail) == 0 {
+	if m.stale {
+		hint := "  " + fg(cAccent).Render(spinner[m.frame%len(spinner)]) + fg(cDim).Render(" rendering large payload…")
+		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ", fit(hint, inner-1)+col(m.w-1)+" ")
+	} else if len(m.detail) == 0 {
 		hint := fg(cDim).Render("  Select a request to inspect it.")
-		lines = append(lines, fit("", inner), fit(hint, inner))
+		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ", fit(hint, inner-1)+col(m.w-1)+" ")
 	} else {
 		total := len(m.detail)
 		thumbLen, thumbPos := h, 0
@@ -386,13 +430,13 @@ func (m *model) detailPanel() string {
 			} else if total <= h {
 				bar = " "
 			}
-			lines = append(lines, fit(text, inner-1)+bar)
+			lines = append(lines, fit(text, inner-1)+col(m.w-1)+bar)
 		}
 	}
 	for len(lines) < h+1 {
-		lines = append(lines, fit("", inner))
+		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ")
 	}
-	return borderBox(lines[:h+1], m.focus == paneDetail)
+	return lines[:h+1]
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +506,9 @@ func (m *model) helpBox() string {
 		"",
 		fg(cDim).Render("Mouse: click rows, tabs and toolbar buttons · wheel scrolls"),
 	}
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cViolet).Padding(1, 3).
-		Render(strings.Join(lines, "\n"))
+	box := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(cViolet).Padding(1, 3)
+	if m.w < 80 || m.h < 36 {
+		box = box.Padding(0, 1) // small terminals: reclaim the margins
+	}
+	return box.Render(strings.Join(lines, "\n"))
 }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"net/http"
 	"os"
 	"regexp"
@@ -85,4 +86,105 @@ func TestRender(t *testing.T) {
 	m.Update(tea.MouseMsg{X: 5, Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	m.Update(tea.MouseMsg{X: 5, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
 	_ = m.View()
+}
+
+var ansiKeep = regexp.MustCompile(`\x1b\[[0-9;]*[mG]`) // the only sequences the renderer may emit
+
+func TestCleanNormalisesAmbiguousText(t *testing.T) {
+	cases := map[string]string{
+		"a\x1b[2Jb":          "a[2Jb",         // ESC dropped
+		"fam👨\u200d👩\u200d👧": "fam👨👩👧",        // ZWJ dropped
+		"warn\u26a0\ufe0f":   "warn⚠",         // VS16 dropped
+		"🇺🇸 and 🇯🇵":          "[US] and [JP]", // flags become text
+		"x\u202eevil":        "xevil",         // bidi override
+		"a\u2028b":           "ab",            // line separator
+		"tab\there":          "tab here",
+	}
+	for in, want := range cases {
+		if got := clean(in, true); got != want {
+			t.Errorf("clean(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := inline("a\nb\r\nc"); got != "a b c" {
+		t.Errorf("inline newline handling: %q", got)
+	}
+	if got := sanitize("l1\nl2"); got != "l1\nl2" {
+		t.Errorf("sanitize must keep newlines: %q", got)
+	}
+}
+
+func TestHostileDataNeverBreaksTheFrame(t *testing.T) {
+	store := inspector.NewStore(100, 4<<20)
+	evil := "evil\n\x1b[2J\x1b[Hmodel 😀👨\u200d👩\u200d👧\u200d👦🇺🇸\u26a0\ufe0f日本語\u202e"
+	big := strings.Repeat("😀 👨\u200d👩\u200d👧\u200d👦 日本語のテキスト \u26a0\ufe0f ✔\ufe0f 🇺🇸 café\\n", 400)
+	for i := 0; i < 5; i++ {
+		ex := store.Begin()
+		ex.Update(func(r *inspector.Record) {
+			r.Client.Method, r.Client.URL, r.Model, r.Dialect, r.Mode = "POST", "/v1/chat?q=\u200b\u2028x", evil, "openai", "translate"
+			r.VHost, r.Backend, r.Host, r.ClientAddr = evil, "openai", evil, "1.2.3.4:5"
+			r.Error = "multi\nline\nerror\x1b[31m"
+			r.Client.ReqHeader = http.Header{"X-Evil": {evil}}
+			r.Client.RespHeader = http.Header{"Content-Type": {"application/json"}}
+			r.Upstream.Method, r.Upstream.URL, r.Upstream.Status = "POST", "http://u/"+evil, 200
+			r.Client.Status, r.Done, r.Finished, r.Stream = 200, true, r.Started.Add(time.Second), true
+		})
+		ex.AppendBody(func(r *inspector.Record) *inspector.Body { return &r.Client.ReqBody },
+			[]byte(`{"model":"`+"m"+`","messages":[{"role":"user\n","content":"`+big+`"}]}`))
+		ex.AppendBody(func(r *inspector.Record) *inspector.Body { return &r.Client.RespBody },
+			[]byte(`{"choices":[{"message":{"role":"assistant","content":"`+big+`"}}]}`))
+		ex.AppendBody(func(r *inspector.Record) *inspector.Body { return &r.Upstream.RespBody },
+			[]byte("data: {\"choices\":[{\"delta\":{\"content\":\""+big+"\"}}]}\n\ndata: [DONE]\n\n"))
+	}
+
+	m := newModel(store, Info{Version: "t", Listen: "127.0.0.1:1", Persist: strings.Repeat("日本語", 20),
+		Hosts: []HostInfo{{Name: "h", Dialects: []string{"openai"}}}})
+	check := func(label string, w, h int) {
+		out := m.View()
+		lines := strings.Split(out, "\n")
+		if len(lines) != h {
+			t.Fatalf("%s: %d lines, want %d", label, len(lines), h)
+		}
+		for i, l := range lines {
+			if got := lipgloss.Width(l); got != w {
+				t.Fatalf("%s: line %d is %d cells wide, want %d", label, i, got, w)
+			}
+		}
+		plain := ansiKeep.ReplaceAllString(out, "")
+		if strings.ContainsRune(plain, '\x1b') {
+			t.Fatalf("%s: stray escape sequence leaked to the terminal", label)
+		}
+		for _, r := range plain {
+			if r != '\n' && unsafeRune(r) {
+				t.Fatalf("%s: unsafe rune %U reached the screen", label, r)
+			}
+			if isRegionalIndicator(r) {
+				t.Fatalf("%s: regional indicator reached the screen", label)
+			}
+		}
+	}
+
+	for _, size := range [][2]int{{140, 40}, {100, 30}, {80, 24}, {61, 13}} {
+		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m.refresh(true)
+		for _, wrap := range []bool{true, false} {
+			m.wrap = wrap
+			for tab := tabOverview; tab < tabCount; tab++ {
+				m.setTab(tab)
+				for i := range m.rows { // every list selection
+					m.cursor = i
+					m.updateDetail(true)
+					check(fmt.Sprintf("%v wrap=%v tab=%d item=%d", size, wrap, tab, i), size[0], size[1])
+				}
+				m.focus = paneDetail
+				for off := 0; off <= len(m.detail)+2; off += 1 + len(m.detail)/25 { // scroll positions across the whole range
+					m.dOff = off
+					m.clampDetail()
+					check(fmt.Sprintf("%v wrap=%v tab=%d off=%d", size, wrap, tab, off), size[0], size[1])
+				}
+				m.focus = paneList
+			}
+		}
+	}
+	m.showHelp = true
+	check("help", 61, 13)
 }
