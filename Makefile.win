@@ -4,7 +4,7 @@
 #   mingw32-make.exe -f Makefile.win tui
 #   mingw32-make.exe -f Makefile.win help
 #
-# Requirements: Go 1.22+ on PATH. Git is optional (used only for the version
+# Requirements: Go 1.26+ on PATH. Git is optional (used only for the version
 # string). "test" additionally needs gcc (MinGW-w64) because the race detector
 # uses cgo; use "test-fast" if you do not have it.
 

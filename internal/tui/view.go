@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // ---------------------------------------------------------------------------
@@ -12,18 +14,18 @@ import (
 // styled string never punch holes in the bar.
 // ---------------------------------------------------------------------------
 
-func on(bg lipgloss.Color, c lipgloss.Color, b bool, s string) string {
+func on(bg color.Color, c color.Color, b bool, s string) string {
 	return lipgloss.NewStyle().Foreground(c).Background(bg).Bold(b).Render(s)
 }
 
-func gap(bg lipgloss.Color, n int) string {
+func gap(bg color.Color, n int) string {
 	if n <= 0 {
 		return ""
 	}
 	return lipgloss.NewStyle().Background(bg).Render(strings.Repeat(" ", n))
 }
 
-func padTo(s string, w int, bg lipgloss.Color) string {
+func padTo(s string, w int, bg color.Color) string {
 	if lipgloss.Width(s) > w {
 		s = lipgloss.NewStyle().MaxWidth(w).Render(s)
 	}
@@ -34,7 +36,18 @@ func padTo(s string, w int, bg lipgloss.Color) string {
 // View
 // ---------------------------------------------------------------------------
 
-func (m *model) View() string {
+// View implements tea.Model. Bubble Tea v2 renders the returned content into a
+// fixed cell grid the size of the terminal: anything too wide or too tall is
+// clipped, so a frame can never grow taller than the screen and scroll it.
+func (m *model) View() tea.View {
+	v := tea.NewView(m.render())
+	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
+	v.WindowTitle = "LLMux"
+	return v
+}
+
+func (m *model) render() string {
 	if m.w < 60 || m.h < 12 {
 		return "\n  LLMux needs at least 60×12 terminal cells.\n"
 	}
@@ -126,10 +139,10 @@ func (m *model) buildToolbar(compact bool) (string, []hit) {
 	var box string
 	switch {
 	case m.focus == paneFilter:
-		box = lipgloss.NewStyle().Foreground(cText).Background(cSel).Render(padTo(" ⌕ "+trunc(m.filter, boxW-5), boxW-1, cSel)) +
+		box = lipgloss.NewStyle().Foreground(cText).Background(cSel).Render(padTo(" ⌕ "+tailCells(m.filter, boxW-5), boxW-1, cSel)) +
 			lipgloss.NewStyle().Foreground(cAccent).Background(cSel).Render("▏")
 	case m.filter != "":
-		box = lipgloss.NewStyle().Foreground(cAccent).Background(bg).Render(padTo(" ⌕ "+trunc(m.filter, boxW-4), boxW, bg))
+		box = lipgloss.NewStyle().Foreground(cAccent).Background(bg).Render(padTo(" ⌕ "+headCells(m.filter, boxW-4), boxW, bg))
 	default:
 		box = on(bg, cDim, false, padTo(" ⌕ filter…  /", boxW, bg))
 	}
@@ -190,14 +203,7 @@ func (m *model) buildToolbar(compact bool) (string, []hit) {
 // List panel
 // ---------------------------------------------------------------------------
 
-// col moves the cursor to an absolute 1-based column. Every structural glyph
-// (panel borders, scrollbar) is preceded by one, so even if the terminal
-// measures some text differently from us, the frame's skeleton stays put and
-// the discrepancy is confined to that one line of content.
-func col(n int) string { return fmt.Sprintf("\x1b[%dG", n) }
-
-// body draws the two bordered panels side by side. Each row is fully
-// anchored; nothing here depends on the width of user content.
+// body draws the two bordered panels side by side.
 func (m *model) body() string {
 	lw, rw := m.leftW(), m.w-m.leftW()
 	lc, rc := cBorder, cBorder
@@ -210,17 +216,17 @@ func (m *model) body() string {
 	left, right := m.listPanel(), m.detailPanel()
 
 	rows := make([]string, 0, m.panelH())
-	rows = append(rows, ls.Render("╭"+strings.Repeat("─", lw-2)+"╮")+col(lw+1)+rs.Render("╭"+strings.Repeat("─", rw-2)+"╮"))
+	rows = append(rows, ls.Render("╭"+strings.Repeat("─", lw-2)+"╮")+rs.Render("╭"+strings.Repeat("─", rw-2)+"╮"))
 	for i := 0; i < m.panelH()-2; i++ {
-		rows = append(rows, ls.Render("│")+left[i]+col(lw)+ls.Render("│")+
-			col(lw+1)+rs.Render("│")+right[i]+col(m.w)+rs.Render("│"))
+		rows = append(rows, ls.Render("│")+left[i]+ls.Render("│")+rs.Render("│")+right[i]+rs.Render("│"))
 	}
-	rows = append(rows, ls.Render("╰"+strings.Repeat("─", lw-2)+"╯")+col(lw+1)+rs.Render("╰"+strings.Repeat("─", rw-2)+"╯"))
+	rows = append(rows, ls.Render("╰"+strings.Repeat("─", lw-2)+"╯")+rs.Render("╰"+strings.Repeat("─", rw-2)+"╯"))
 	return strings.Join(rows, "\n")
 }
 
-// compose stacks the sections and enforces the invariant the terminal needs:
-// exactly m.h lines, none of them containing a stray line break.
+// compose stacks the sections into exactly m.h lines with no stray line breaks
+// and nothing wider than the terminal (the renderer would clip it anyway; this
+// keeps the model's own picture of the frame honest).
 func (m *model) compose(parts ...string) string {
 	lines := strings.Split(strings.Join(parts, "\n"), "\n")
 	switch {
@@ -234,10 +240,12 @@ func (m *model) compose(parts ...string) string {
 			lines = append(lines[:len(lines)-1], "", lines[len(lines)-1])
 		}
 	}
-	for i, l := range lines { // last line of defence: nothing may exceed the terminal width
-		if lipgloss.Width(l) > m.w {
-			lines[i] = lipgloss.NewStyle().MaxWidth(m.w).Render(l)
+	for i, l := range lines {
+		l = scrub(l)
+		if lipgloss.Width(l) > m.w { // last line of defence: nothing may exceed the terminal width
+			l = scrub(lipgloss.NewStyle().MaxWidth(m.w).Render(l))
 		}
+		lines[i] = l
 	}
 	return strings.Join(lines, "\n")
 }
@@ -292,7 +300,7 @@ func (m *model) emptyState(w, h int) []string {
 		msg = "No requests match the current filters"
 	}
 	out = append(out,
-		center(fg(cAccent).Render(spinner[m.frame%len(spinner)])+" "+bold(cText).Render(msg)),
+		center(fg(cAccent).Render(spinner[m.spin%len(spinner)])+" "+bold(cText).Render(msg)),
 		"",
 		center(fg(cDim).Render("point a client at")),
 		center(fg(cViolet).Render("http://"+m.info.Listen+"/v1")),
@@ -304,14 +312,14 @@ func (m *model) emptyState(w, h int) []string {
 func (m *model) row(i, w int) (string, string) {
 	s := m.rows[i]
 	sel := i == m.cursor
-	st := func(c lipgloss.Color, b bool) lipgloss.Style {
+	st := func(c color.Color, b bool) lipgloss.Style {
 		x := lipgloss.NewStyle().Foreground(c).Bold(b)
 		if sel {
 			x = x.Background(cSel)
 		}
 		return x
 	}
-	bgc := lipgloss.Color("")
+	var bgc color.Color // nil = no background
 	if sel {
 		bgc = cSel
 	}
@@ -322,17 +330,17 @@ func (m *model) row(i, w int) (string, string) {
 		bar = st(cAccent, true).Render("▌")
 	}
 	var code string
-	col := statusColor(s.Status, s.Done)
+	scol := statusColor(s.Status, s.Done)
 	switch {
 	case !s.Done && s.Status == 0:
-		code = spinner[m.frame%len(spinner)] + "  "
+		code = spinner[m.spin%len(spinner)] + "  "
 	case s.Status == 0:
 		code = "ERR"
 	default:
 		code = fmt.Sprintf("%d", s.Status)
 	}
 	path := trunc(s.Path, w-17)
-	l1 := bar + st(col, true).Render("●") + sp + st(col, true).Render(fmt.Sprintf("%-3s", code)) + sp +
+	l1 := bar + st(scol, true).Render("●") + sp + st(scol, true).Render(fmt.Sprintf("%-3s", code)) + sp +
 		st(methodColor(s.Method), true).Render(fmt.Sprintf("%-6s", s.Method)) + st(cText, sel).Render(path)
 
 	glyph := "→"
@@ -401,40 +409,42 @@ func (m *model) detailPanel() []string {
 	inner := m.detailW()
 	h := m.detailH()
 	tabs, _ := m.tabStrip()
-	lines := []string{fit(" "+tabs, inner-1) + col(m.w-1) + " "}
+	lines := []string{fit(" "+tabs, inner-1) + " "}
+	blank := fit("", inner-1) + " "
 
-	if m.stale {
-		hint := "  " + fg(cAccent).Render(spinner[m.frame%len(spinner)]) + fg(cDim).Render(" rendering large payload…")
-		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ", fit(hint, inner-1)+col(m.w-1)+" ")
-	} else if len(m.detail) == 0 {
+	switch {
+	case m.stale:
+		hint := "  " + fg(cAccent).Render(spinner[m.spin%len(spinner)]) + fg(cDim).Render(" rendering large payload…")
+		lines = append(lines, blank, fit(hint, inner-1)+" ")
+	case len(m.detail) == 0:
 		hint := fg(cDim).Render("  Select a request to inspect it.")
-		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ", fit(hint, inner-1)+col(m.w-1)+" ")
-	} else {
-		total := len(m.detail)
+		lines = append(lines, blank, fit(hint, inner-1)+" ")
+	default:
+		// The bubbles viewport owns scrolling and clipping; this adds the scrollbar.
+		total, off := m.vp.TotalLineCount(), m.vp.YOffset()
 		thumbLen, thumbPos := h, 0
 		if total > h {
-			thumbLen = h * h / total
-			if thumbLen < 1 {
-				thumbLen = 1
-			}
-			thumbPos = m.dOff * (h - thumbLen) / (total - h)
+			thumbLen = max(1, h*h/total)
+			thumbPos = off * (h - thumbLen) / (total - h)
 		}
+		view := strings.Split(m.vp.View(), "\n")
 		for i := 0; i < h; i++ {
 			text := ""
-			if idx := m.dOff + i; idx < total {
-				text = m.detail[idx]
+			if i < len(view) {
+				text = view[i]
 			}
 			bar := fg(cBorder).Render("│")
-			if total > h && i >= thumbPos && i < thumbPos+thumbLen {
-				bar = fg(cAccent).Render("┃")
-			} else if total <= h {
+			switch {
+			case total <= h:
 				bar = " "
+			case i >= thumbPos && i < thumbPos+thumbLen:
+				bar = fg(cAccent).Render("┃")
 			}
-			lines = append(lines, fit(text, inner-1)+col(m.w-1)+bar)
+			lines = append(lines, fit(text, inner-1)+bar)
 		}
 	}
 	for len(lines) < h+1 {
-		lines = append(lines, fit("", inner-1)+col(m.w-1)+" ")
+		lines = append(lines, blank)
 	}
 	return lines[:h+1]
 }
@@ -464,9 +474,9 @@ func (m *model) statusBar() string {
 	if len(m.rows) > 0 {
 		pos = fmt.Sprintf("%d/%d", m.cursor+1, len(m.rows))
 	}
-	pct := 100
-	if max := len(m.detail) - m.detailH(); max > 0 {
-		pct = m.dOff * 100 / max
+	pct := int(m.vp.ScrollPercent()*100 + 0.5)
+	if len(m.detail) <= m.detailH() {
+		pct = 100
 	}
 	right := on(bg, cDim, false, "item ") + on(bg, cText, false, pos) +
 		on(bg, cDim, false, "  scroll ") + on(bg, cText, false, fmt.Sprintf("%d%%", pct)) + gap(bg, 1)
@@ -478,7 +488,7 @@ func (m *model) helpBox() string {
 	row := func(k, d string) string {
 		return bold(cAccent).Render(fmt.Sprintf("%-16s", k)) + fg(cText).Render(d)
 	}
-	title := gradient("◆ LLMUX · keyboard & mouse", "#22d3ee", "#a78bfa", "")
+	title := gradient("◆ LLMUX · keyboard & mouse", "#22d3ee", "#a78bfa", nil)
 	lines := []string{
 		title, "",
 		fg(cViolet).Render("Navigate"),

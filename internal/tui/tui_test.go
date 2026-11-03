@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/rnapoles/llmux/internal/inspector"
 )
@@ -47,7 +47,7 @@ func TestRender(t *testing.T) {
 	for _, size := range [][2]int{{140, 40}, {100, 30}, {70, 16}} {
 		m.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		m.refresh(true)
-		out := m.View()
+		out := m.render()
 		lines := strings.Split(out, "\n")
 		if len(lines) != size[1] {
 			t.Errorf("%v: got %d lines", size, len(lines))
@@ -60,7 +60,7 @@ func TestRender(t *testing.T) {
 		}
 		if size[0] == 140 && os.Getenv("SHOW") != "" {
 			show := func(n int) {
-				for _, l := range strings.Split(ansiRe.ReplaceAllString(m.View(), ""), "\n")[:n] {
+				for _, l := range strings.Split(ansiRe.ReplaceAllString(m.render(), ""), "\n")[:n] {
 					println(strings.TrimRight(l, " "))
 				}
 			}
@@ -76,19 +76,19 @@ func TestRender(t *testing.T) {
 			m.showHelp = false
 		}
 		if size[0] == 70 && os.Getenv("SHOW") != "" {
-			println(ansiRe.ReplaceAllString(m.View(), ""))
+			println(ansiRe.ReplaceAllString(m.render(), ""))
 		}
 	}
 	// keys & mouse must not panic
 	for _, k := range []string{"j", "k", "tab", "down", "G", "g", "s", "s", "s", "d", "p", "p", "w", "r", "f", "?", "esc", "1", "5", "/", "x", "esc", "c"} {
-		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+		m.Update(kp(k))
 	}
-	m.Update(tea.MouseMsg{X: 5, Y: 1, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
-	m.Update(tea.MouseMsg{X: 5, Y: 5, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
-	_ = m.View()
+	m.Update(click(5, 1))
+	m.Update(click(5, 5))
+	_ = m.render()
 }
 
-var ansiKeep = regexp.MustCompile(`\x1b\[[0-9;]*[mG]`) // the only sequences the renderer may emit
+var ansiKeep = regexp.MustCompile(`\x1b\[[0-9;]*m`) // the only escape sequences content may contain (colours)
 
 func TestCleanNormalisesAmbiguousText(t *testing.T) {
 	cases := map[string]string{
@@ -139,7 +139,7 @@ func TestHostileDataNeverBreaksTheFrame(t *testing.T) {
 	m := newModel(store, Info{Version: "t", Listen: "127.0.0.1:1", Persist: strings.Repeat("日本語", 20),
 		Hosts: []HostInfo{{Name: "h", Dialects: []string{"openai"}}}})
 	check := func(label string, w, h int) {
-		out := m.View()
+		out := m.render()
 		lines := strings.Split(out, "\n")
 		if len(lines) != h {
 			t.Fatalf("%s: %d lines, want %d", label, len(lines), h)
@@ -177,8 +177,7 @@ func TestHostileDataNeverBreaksTheFrame(t *testing.T) {
 				}
 				m.focus = paneDetail
 				for off := 0; off <= len(m.detail)+2; off += 1 + len(m.detail)/25 { // scroll positions across the whole range
-					m.dOff = off
-					m.clampDetail()
+					m.vp.SetYOffset(off)
 					check(fmt.Sprintf("%v wrap=%v tab=%d off=%d", size, wrap, tab, off), size[0], size[1])
 				}
 				m.focus = paneList
@@ -187,4 +186,77 @@ func TestHostileDataNeverBreaksTheFrame(t *testing.T) {
 	}
 	m.showHelp = true
 	check("help", 61, 13)
+}
+
+func TestScrubOnlyLetsColourSequencesThrough(t *testing.T) {
+	ok := "\x1b[38;5;81mtext\x1b[0m│"
+	if got := scrub(ok); got != ok {
+		t.Errorf("colour sequences must pass unchanged: %q", got)
+	}
+	cases := map[string]string{
+		"a\x1b[2Jb":          "a[2Jb",     // clear screen
+		"a\x1b[Hb":           "a[Hb",      // cursor home
+		"a\x1b[12Gb":         "a[12Gb",    // cursor placement belongs to the renderer
+		"a\x1b[?1049lb":      "a[?1049lb", // leave alternate screen
+		"a\x1b]0;title\x07b": "a]0;titleb",
+		"a\x00\x07\rb\x7fc":  "abc",
+		"a\u0085b\u009bc":    "abc", // C1 controls
+		"a\x1b[31;1mb":       "a\x1b[31;1mb",
+	}
+	for in, want := range cases {
+		if got := scrub(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestFilterInputIsCleanedAndBounded(t *testing.T) {
+	m := bigModel(2, 8)
+	m.Update(kp("/"))
+	m.Update(paste("first line\nsecond\t\x1b[2Jline\r\n"))
+	if m.filter != "first line second [2Jline " { // ESC dropped; the leftover text is inert
+		t.Errorf("pasted text not neutralised: %q", m.filter)
+	}
+	m.Update(paste(strings.Repeat("日本語 ", 2000)))
+	if n := len([]rune(m.filter)); n != maxFilterRunes {
+		t.Errorf("filter has %d runes, want the cap of %d", n, maxFilterRunes)
+	}
+	// the toolbar stays exactly one row at every width, whatever the filter holds
+	for _, w := range []int{60, 80, 140, 200} {
+		m.Update(tea.WindowSizeMsg{Width: w, Height: 30})
+		tb, _ := m.toolbar()
+		if strings.Contains(tb, "\n") || lipgloss.Width(tb) != w {
+			t.Errorf("width %d: toolbar is %d cells / contains newline: %v", w, lipgloss.Width(tb), strings.Contains(tb, "\n"))
+		}
+	}
+}
+
+func TestCellAwareTruncation(t *testing.T) {
+	if got := tailCells("abcdefghij", 6); got != "…fghij" {
+		t.Errorf("tailCells = %q", got)
+	}
+	if got := headCells("abcdefghij", 6); got != "abcde…" {
+		t.Errorf("headCells = %q", got)
+	}
+	for _, s := range []string{"日本語のテキスト", "😀😀😀😀", "mixed 日本 text", ""} {
+		for w := 1; w < 14; w++ {
+			if lipgloss.Width(headCells(s, w)) > w || lipgloss.Width(tailCells(s, w)) > w {
+				t.Errorf("%q does not fit %d cells: %q / %q", s, w, headCells(s, w), tailCells(s, w))
+			}
+		}
+	}
+}
+
+func TestViewDeclaresAltScreenAndMouse(t *testing.T) {
+	m := bigModel(2, 8)
+	v := m.View()
+	if !v.AltScreen {
+		t.Error("the TUI must run on the alternate screen")
+	}
+	if v.MouseMode != tea.MouseModeCellMotion {
+		t.Error("mouse support must be requested through the View")
+	}
+	if v.Content == "" {
+		t.Error("empty frame")
+	}
 }

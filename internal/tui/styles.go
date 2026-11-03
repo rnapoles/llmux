@@ -2,10 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 )
 
 // Palette: deep-space neutrals with neon cyan/violet accents.
@@ -27,12 +28,12 @@ var (
 	cInk    = lipgloss.Color("#06121f") // dark text on bright fills
 )
 
-func fg(c lipgloss.Color) lipgloss.Style { return lipgloss.NewStyle().Foreground(c) }
+func fg(c color.Color) lipgloss.Style { return lipgloss.NewStyle().Foreground(c) }
 
-func bold(c lipgloss.Color) lipgloss.Style { return lipgloss.NewStyle().Foreground(c).Bold(true) }
+func bold(c color.Color) lipgloss.Style { return lipgloss.NewStyle().Foreground(c).Bold(true) }
 
 // gradient colours each rune of s between two #rrggbb colours.
-func gradient(s, from, to string, bg lipgloss.Color) string {
+func gradient(s, from, to string, bg color.Color) string {
 	r1, g1, b1 := hexRGB(from)
 	r2, g2, b2 := hexRGB(to)
 	runes := []rune(s)
@@ -47,7 +48,7 @@ func gradient(s, from, to string, bg lipgloss.Color) string {
 			int(float64(g1)+(float64(g2)-float64(g1))*t),
 			int(float64(b1)+(float64(b2)-float64(b1))*t))
 		st := lipgloss.NewStyle().Foreground(lipgloss.Color(c)).Bold(true)
-		if bg != "" {
+		if bg != nil {
 			st = st.Background(bg)
 		}
 		sb.WriteString(st.Render(string(r)))
@@ -61,7 +62,7 @@ func hexRGB(h string) (int, int, int) {
 	return r, g, b
 }
 
-func statusColor(code int, done bool) lipgloss.Color {
+func statusColor(code int, done bool) color.Color {
 	switch {
 	case !done && code == 0:
 		return cAccent
@@ -76,7 +77,7 @@ func statusColor(code int, done bool) lipgloss.Color {
 	}
 }
 
-func methodColor(m string) lipgloss.Color {
+func methodColor(m string) color.Color {
 	switch m {
 	case "GET":
 		return cBlue

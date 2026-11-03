@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 
 	"github.com/rnapoles/llmux/internal/inspector"
 	wire "github.com/rnapoles/llmux/internal/wire/openai"

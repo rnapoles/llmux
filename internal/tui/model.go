@@ -5,7 +5,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/rnapoles/llmux/internal/inspector"
 )
@@ -78,12 +79,12 @@ type model struct {
 	raw      bool
 	showHelp bool
 	tab      tabID
-	frame    int
+	spin     int // spinner frame
 
-	detail    []string
-	dOff      int
-	detailKey string // identity of what m.detail shows, including the exchange revision
-	viewKey   string // same, without the revision (to spot "same view, new data")
+	detail    []string       // rendered lines of the selected view (also the cache payload)
+	vp        viewport.Model // owns scrolling and clipping of m.detail
+	detailKey string         // identity of what m.detail shows, including the exchange revision
+	viewKey   string         // same, without the revision (to spot "same view, new data")
 	detailID  uint64
 
 	// Rendering performance (see updateDetail / requestDetail).
@@ -107,7 +108,7 @@ func newModel(store *inspector.Store, info Info) *model {
 			}
 		}
 	}
-	return &model{store: store, info: info, follow: true, wrap: true, dialects: ds, lastVer: ^uint64(0), cache: map[string][]string{}}
+	return &model{store: store, info: info, follow: true, wrap: true, dialects: ds, lastVer: ^uint64(0), cache: map[string][]string{}, vp: viewport.New()}
 }
 
 func tick() tea.Cmd {
@@ -294,7 +295,8 @@ func (m *model) dropCache() {
 //   - otherwise rendered now (force bypasses the throttles).
 func (m *model) updateDetail(force bool) {
 	if len(m.exs) == 0 || m.cursor >= len(m.exs) {
-		m.detail, m.detailKey, m.viewKey, m.stale = nil, "", "", false
+		m.detailKey, m.viewKey, m.stale = "", "", false
+		m.setDetail(nil)
 		return
 	}
 	if m.stale && !force {
@@ -306,11 +308,12 @@ func (m *model) updateDetail(force bool) {
 		return
 	}
 	if id != m.detailID {
-		m.detailID, m.dOff = id, 0
+		m.detailID = id
+		m.vp.GotoTop()
 	}
 	if lines, ok := m.cache[key]; ok {
-		m.detail, m.detailKey, m.viewKey, m.stale = lines, key, view, false
-		m.clampDetail()
+		m.detailKey, m.viewKey, m.stale = key, view, false
+		m.setDetail(lines)
 		return
 	}
 	done := m.rows[m.cursor].Done
@@ -328,11 +331,11 @@ func (m *model) updateDetail(force bool) {
 	}
 	lines := buildDetail(rec, m.tab, m.raw, m.wrap, m.detailW()-1)
 	m.lastBuild, m.builtAt = time.Since(t0), time.Now()
-	m.detail, m.detailKey, m.viewKey, m.stale = lines, key, view, false
+	m.detailKey, m.viewKey, m.stale = key, view, false
+	m.setDetail(lines)
 	if done {
 		m.remember(key, lines)
 	}
-	m.clampDetail()
 }
 
 // requestDetail is updateDetail for selection changes. Cheap or cached views
@@ -362,30 +365,35 @@ func (m *model) takeCmd() tea.Cmd {
 	return c
 }
 
-func (m *model) clampDetail() {
-	max := len(m.detail) - m.detailH()
-	if max < 0 {
-		max = 0
-	}
-	if m.dOff > max {
-		m.dOff = max
-	}
-	if m.dOff < 0 {
-		m.dOff = 0
-	}
+// syncVP keeps the viewport the size of the detail text area.
+func (m *model) syncVP() {
+	m.vp.SetWidth(max(1, m.detailW()-1))
+	m.vp.SetHeight(m.detailH())
 }
+
+// setDetail installs new content; the viewport keeps (and clamps) its offset.
+func (m *model) setDetail(lines []string) {
+	m.detail = lines
+	m.syncVP()
+	m.vp.SetContentLines(lines)
+}
+
+func (m *model) clampDetail() { m.vp.SetYOffset(m.vp.YOffset()) } // re-clamp after a size change
 
 func (m *model) move(delta int) {
 	m.cursor += delta
 	m.follow = false
 	m.clamp()
-	m.dOff = 0
+	m.vp.GotoTop()
 	m.requestDetail()
 }
 
 func (m *model) scrollDetail(delta int) {
-	m.dOff += delta
-	m.clampDetail()
+	if delta < 0 {
+		m.vp.ScrollUp(-delta)
+	} else {
+		m.vp.ScrollDown(delta)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -396,10 +404,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		m.syncVP()
 		m.clamp()
 		m.updateDetail(true)
 	case tickMsg:
-		m.frame++
+		m.spin++
 		m.refresh(false)
 		return m, tea.Batch(tick(), m.takeCmd())
 	case buildMsg:
@@ -409,34 +418,35 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case serverErrMsg:
 		m.fatal = msg.err
 		return m, tea.Quit
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		mm, cmd := m.onKey(msg)
 		return mm, tea.Batch(cmd, m.takeCmd())
-	case tea.MouseMsg:
-		m.onMouse(msg)
+	case tea.PasteMsg:
+		m.onPaste(msg.Content)
+	case tea.MouseClickMsg:
+		m.onClick(tea.Mouse(msg))
+	case tea.MouseWheelMsg:
+		m.onWheel(tea.Mouse(msg))
 	}
 	return m, m.takeCmd()
 }
 
-func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// onPaste handles bracketed paste. Pasted text is untrusted: it only ever goes
+// into the filter box (cleaned and bounded by typeFilter); anywhere else it is
+// ignored, so it can never trigger shortcuts (a stray "q" would quit).
+func (m *model) onPaste(text string) {
+	if m.focus != paneFilter || m.showHelp {
+		return
+	}
+	m.typeFilter(text)
+	m.follow = true
+	m.refresh(true)
+}
+
+func (m *model) onKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	s := msg.String()
 	if s == "ctrl+c" {
 		return m, tea.Quit
-	}
-	// Bubble Tea delivers keys that arrive in the same read (a held arrow key
-	// while the app is busy) as ONE message such as "jjjj". Replay them one by
-	// one so no keystroke is lost. Pasted text must never trigger shortcuts
-	// (a stray "q" would quit), so outside the filter box it is ignored.
-	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && m.focus != paneFilter {
-		if msg.Paste {
-			return m, nil
-		}
-		var cmds []tea.Cmd
-		for _, r := range msg.Runes {
-			_, c := m.onKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
-			cmds = append(cmds, c)
-		}
-		return m, tea.Batch(cmds...)
 	}
 	if m.showHelp {
 		switch s {
@@ -446,17 +456,19 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.focus == paneFilter {
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyEnter, tea.KeyTab:
+		switch s {
+		case "esc", "enter", "tab":
 			m.focus = paneList
-		case tea.KeyBackspace:
+		case "backspace":
 			if r := []rune(m.filter); len(r) > 0 {
 				m.filter = string(r[:len(r)-1])
 			}
-		case tea.KeyCtrlU:
+		case "ctrl+u":
 			m.filter = ""
-		case tea.KeyRunes, tea.KeySpace:
-			m.filter += string(msg.Runes)
+		default:
+			if k := msg.Key(); k.Text != "" { // printable text (a space has Text " ")
+				m.typeFilter(k.Text)
+			}
 		}
 		m.follow = true
 		m.refresh(true)
@@ -514,7 +526,7 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.navigate(m.page())
 	case "home", "g":
 		if m.focus == paneDetail {
-			m.dOff = 0
+			m.vp.GotoTop()
 		} else {
 			m.follow = true
 			m.cursor = 0
@@ -523,8 +535,7 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "end", "G":
 		if m.focus == paneDetail {
-			m.dOff = 1 << 30
-			m.clampDetail()
+			m.vp.GotoBottom()
 		} else {
 			m.move(len(m.rows))
 		}
@@ -532,7 +543,7 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollDetail(-3)
 	case "J":
 		m.scrollDetail(3)
-	case " ":
+	case "space":
 		m.scrollDetail(m.detailH() - 1)
 	case "b":
 		m.scrollDetail(-(m.detailH() - 1))
@@ -561,6 +572,22 @@ func (m *model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// maxFilterRunes bounds the filter text: pasting a whole document must not be
+// able to grow state (or the toolbar) without limit.
+const maxFilterRunes = 200
+
+// typeFilter appends typed or pasted text to the filter. Pasted text is
+// untrusted terminal input: control characters, escape sequences and line
+// breaks are neutralised (a newline would split the toolbar into several rows
+// and tear the layout apart; an escape sequence could drive the terminal).
+func (m *model) typeFilter(s string) {
+	r := []rune(m.filter + inline(s))
+	if len(r) > maxFilterRunes {
+		r = r[:maxFilterRunes]
+	}
+	m.filter = string(r)
+}
+
 func (m *model) page() int {
 	if m.focus == paneDetail {
 		return m.detailH() / 2
@@ -583,7 +610,8 @@ func (m *model) setTab(t tabID) {
 	if t >= tabCount {
 		t = 0
 	}
-	m.tab, m.dOff = t, 0
+	m.tab = t
+	m.vp.GotoTop()
 	m.updateDetail(true)
 }
 
@@ -652,61 +680,59 @@ func (m *model) act(a string) {
 	}
 }
 
-func (m *model) onMouse(msg tea.MouseMsg) {
+func (m *model) onWheel(ms tea.Mouse) {
 	if m.showHelp {
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		return
+	}
+	d := 1
+	if ms.Button == tea.MouseWheelUp {
+		d = -1
+	}
+	if ms.X < m.leftW() {
+		m.move(d)
+	} else {
+		m.scrollDetail(3 * d)
+	}
+}
+
+func (m *model) onClick(ms tea.Mouse) {
+	if m.showHelp {
+		if ms.Button == tea.MouseLeft {
 			m.showHelp = false
 		}
 		return
 	}
-	inList := msg.X < m.leftW()
-	switch msg.Button {
-	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
-		d := 1
-		if msg.Button == tea.MouseButtonWheelUp {
-			d = -1
-		}
-		if inList {
-			m.move(d)
-		} else {
-			m.scrollDetail(3 * d)
-		}
-		return
-	case tea.MouseButtonLeft:
-		if msg.Action != tea.MouseActionPress {
-			return
-		}
-	default:
+	if ms.Button != tea.MouseLeft {
 		return
 	}
-
+	inList := ms.X < m.leftW()
 	switch {
-	case msg.Y == 1: // toolbar
+	case ms.Y == 1: // toolbar
 		_, hits := m.toolbar()
 		for _, h := range hits {
-			if msg.X >= h.x0 && msg.X < h.x1 {
+			if ms.X >= h.x0 && ms.X < h.x1 {
 				m.act(h.act)
 				return
 			}
 		}
-	case inList && msg.Y >= 4 && msg.Y < 2+m.panelH()-1:
+	case inList && ms.Y >= 4 && ms.Y < 2+m.panelH()-1:
 		m.focus = paneList
-		idx := m.offset + (msg.Y-4)/2
+		idx := m.offset + (ms.Y-4)/2
 		if idx < len(m.rows) {
 			m.cursor = idx
 			m.follow = false
-			m.dOff = 0
+			m.vp.GotoTop()
 			m.requestDetail()
 		}
-	case !inList && msg.Y == 3: // tab strip
+	case !inList && ms.Y == 3: // tab strip
 		m.focus = paneDetail
 		for i, h := range m.tabHits() {
-			if msg.X >= h.x0 && msg.X < h.x1 {
+			if ms.X >= h.x0 && ms.X < h.x1 {
 				m.setTab(tabID(i))
 				return
 			}
 		}
-	case !inList && msg.Y > 3:
+	case !inList && ms.Y > 3:
 		m.focus = paneDetail
 	}
 }

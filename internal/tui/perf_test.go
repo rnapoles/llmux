@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/rnapoles/llmux/internal/inspector"
 )
@@ -58,8 +58,8 @@ func TestPerfReport(t *testing.T) {
 		m.focus = paneDetail
 		t0 = time.Now()
 		for i := 0; i < 50; i++ {
-			m.dOff = i * 3
-			_ = m.View()
+			m.vp.SetYOffset(i * 3)
+			_ = m.render()
 		}
 		view := time.Since(t0) / 50
 
@@ -126,7 +126,7 @@ func TestHeavySelectionChangesAreDebounced(t *testing.T) {
 	if m.cmd == nil {
 		t.Fatal("a debounce timer should have been scheduled")
 	}
-	if !strings.Contains(ansiRe.ReplaceAllString(m.View(), ""), "rendering") {
+	if !strings.Contains(ansiRe.ReplaceAllString(m.render(), ""), "rendering") {
 		t.Error("a placeholder should be shown while the render is pending")
 	}
 
@@ -140,7 +140,7 @@ func TestHeavySelectionChangesAreDebounced(t *testing.T) {
 	if m.stale || m.detailID != m.rows[m.cursor].ID {
 		t.Fatalf("latest timer must render the settled selection (stale=%v)", m.stale)
 	}
-	if strings.Contains(ansiRe.ReplaceAllString(m.View(), ""), "rendering large") {
+	if strings.Contains(ansiRe.ReplaceAllString(m.render(), ""), "rendering large") {
 		t.Error("placeholder should be gone after the render")
 	}
 }
@@ -191,37 +191,41 @@ func TestSnapshotLimitCapsCopiedBytes(t *testing.T) {
 	}
 }
 
-func TestCoalescedKeyRepeatsAreNotLost(t *testing.T) {
+func TestPasteNeverFiresShortcutsAndFeedsOnlyTheFilter(t *testing.T) {
 	m := bigModel(8, 8)
 	m.lastBuild = 0
 	m.focus = paneList
 	start := m.cursor
 
-	// Bubble Tea delivers keys that arrive in the same read as ONE message.
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("jjjj")})
-	if m.cursor != start+4 {
-		t.Fatalf("4 queued 'j' presses moved the cursor by %d, want 4", m.cursor-start)
-	}
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("kk")})
-	if m.cursor != start+2 {
-		t.Fatalf("cursor at %d, want %d", m.cursor, start+2)
-	}
-
-	// Pasted text must never fire shortcuts (a stray "q" would quit the app).
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("pasted quit text"), Paste: true})
+	// Pasted text outside the filter box must be ignored entirely: a stray
+	// "q" or "p" inside it must not quit, pause, move the cursor, ...
+	_, cmd := m.Update(paste("pasted quit text jjjjj"))
 	if cmd != nil {
 		if _, quit := cmd().(tea.QuitMsg); quit {
 			t.Fatal("pasted text quit the application")
 		}
 	}
-	if m.paused || m.showHelp {
-		t.Error("pasted text triggered shortcuts")
+	if m.paused || m.showHelp || m.cursor != start || m.filter != "" {
+		t.Errorf("pasted text had an effect: paused=%v help=%v cursor=%d filter=%q", m.paused, m.showHelp, m.cursor, m.filter)
 	}
 
-	// ...but it is welcome in the filter box.
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("/")})
-	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("gpt-4o"), Paste: true})
+	// Ordinary key presses are delivered one at a time in v2: nothing is merged or lost.
+	for i := 0; i < 4; i++ {
+		m.Update(kp("j"))
+	}
+	if m.cursor != start+4 {
+		t.Fatalf("4 presses moved the cursor by %d", m.cursor-start)
+	}
+
+	// ...but paste is welcome in the filter box.
+	m.Update(kp("/"))
+	m.Update(paste("gpt-4o"))
 	if m.filter != "gpt-4o" {
 		t.Errorf("filter = %q", m.filter)
+	}
+	m.Update(kp("space"))
+	m.Update(kp("x"))
+	if m.filter != "gpt-4o x" {
+		t.Errorf("typed text (including space) must reach the filter: %q", m.filter)
 	}
 }

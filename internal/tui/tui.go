@@ -1,12 +1,13 @@
 // Package tui implements LLMux's interactive traffic inspector.
+//
+// It is built on Bubble Tea v2, whose renderer draws into a fixed grid of
+// terminal cells: content that is too wide or too tall is clipped instead of
+// wrapping onto extra rows, so no payload can make the frame grow and scroll
+// the header off screen. The detail pane scrolls with the Bubbles viewport.
 package tui
 
 import (
-	"fmt"
-	"os"
-
-	"github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/rnapoles/llmux/internal/inspector"
 )
@@ -31,23 +32,14 @@ type Info struct {
 
 // Run shows the TUI until the user quits or the server fails (errc).
 func Run(store *inspector.Store, info Info, errc <-chan error) error {
-	// The palette is designed for dark terminals; pin it so no adaptive colour
-	// logic can ever flip it.
-	lipgloss.SetHasDarkBackground(true)
 	m := newModel(store, info)
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	p := tea.NewProgram(m) // alt screen and mouse mode are declared by View()
 	go func() {
 		if err, ok := <-errc; ok && err != nil {
 			p.Send(serverErrMsg{err})
 		}
 	}()
-	// DECAWM off: if a terminal ever disagrees with us about a character's
-	// width, the overflow is clipped instead of wrapping onto a new row, which
-	// would push the whole frame down and scroll the header off screen.
-	fmt.Fprint(os.Stdout, "\x1b[?7l")
-	defer fmt.Fprint(os.Stdout, "\x1b[?7h")
-	_, err := p.Run()
-	if err != nil {
+	if _, err := p.Run(); err != nil {
 		return err
 	}
 	return m.fatal
